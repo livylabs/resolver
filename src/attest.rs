@@ -1,4 +1,6 @@
-use livy_tee::{Livy, Attestation};
+//! Experimental attestation helpers for provenance work.
+
+use livy_tee::{Attestation, Livy};
 
 
 async fn mockattestation(input: &str)  {
@@ -14,6 +16,5 @@ async fn mockattestation(input: &str)  {
 async fn track_attest(witness: Attestation) {
     // Post attestation to our provenance layer 
 }
-
 
 

@@ -1,22 +1,61 @@
+//! Axum entrypoint that mounts HTTP product routes and MCP transport.
+
 mod api;
-mod fetch;
 mod errors;
-use api::{fetch_post, fetch_unblock};
-use axum::{routing::post, Router};
+mod fetch;
+mod mcp;
+mod types;
+use api::{
+    crawl_post, extract_post, fetch_fast, fetch_post, fetch_unblock, get_receipt, map_post,
+    screenshot_post, search_post,
+};
+use axum::{
+    Router,
+    routing::{get, post},
+};
 use std::sync::Arc;
 
+use crate::errors::{FetchError, Result};
+use rmcp::transport::streamable_http_server::{
+    StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
+};
+
 #[tokio::main]
-async fn main() {
-    //let input = "Hello" ;
-    //let output = "Livy";
-    //mockattestation(input, output).await
-    let fetcher =  Arc::new(fetch::Fetcher::new());
+async fn main() -> Result<()> {
+    let fetcher = Arc::new(fetch::Fetcher::new());
+    let mcp_fetcher = fetcher.clone();
+
+    let mcp_service = StreamableHttpService::new(
+        move || Ok(mcp::Server::new(mcp_fetcher.clone())),
+        LocalSessionManager::default().into(),
+        mcp_config(),
+    );
+
     let app = Router::new()
         .route("/fetch", post(fetch_post))
-        .route("/fetchunblock",post(fetch_unblock)).with_state(fetcher)
-        ;
-    let listener = tokio::net::TcpListener::bind("0.0.0.0:3001").await.unwrap();
-    axum::serve(listener,app).await.unwrap();
+        .route("/crawl", post(crawl_post))
+        .route("/map", post(map_post))
+        .route("/search", post(search_post))
+        .route("/extract", post(extract_post))
+        .route("/screenshot", post(screenshot_post))
+        .route("/fetchfast", post(fetch_fast))
+        .route("/fetchunblock", post(fetch_unblock))
+        .route("/receipt/{id}", get(get_receipt))
+        .route("/recipt/{id}", get(get_receipt))
+        .nest_service("/mcp", mcp_service)
+        .with_state(fetcher);
+
+    let listener = tokio::net::TcpListener::bind("0.0.0.0:3001")
+        .await
+        .map_err(|err| FetchError::Http(err.to_string()))?;
+
+    axum::serve(listener, app)
+        .await
+        .map_err(|err| FetchError::Http(err.to_string()))?;
+
+    Ok(())
 }
 
-
+fn mcp_config() -> StreamableHttpServerConfig {
+    StreamableHttpServerConfig::default().disable_allowed_hosts()
+}
