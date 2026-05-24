@@ -31,8 +31,9 @@ impl Fetcher {
     pub fn new() -> Self {
         dotenvy::dotenv().ok();
         let key = std::env::var("SPIDER_API_KEY")
+            .or_else(|_| std::env::var("SPIDER_KEY"))
             .or_else(|_| std::env::var("LIVY_KEY"))
-            .expect("SPIDER_API_KEY or LIVY_KEY must be set");
+            .expect("SPIDER_API_KEY, SPIDER_KEY, or LIVY_KEY must be set");
         let spider = Spider::new(Some(key)).expect("Can initiate fetcher service");
         let provenance = ProvenanceClient::from_env()
             .unwrap_or_else(|err| panic!("invalid provenance configuration: {err}"));

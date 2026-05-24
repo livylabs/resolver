@@ -12,7 +12,7 @@ mcp = []
 axum = {version = "0.8.9" , features = ["macros"]}
 dotenvy = "0.15.7"
 hex = "0.4.3"
-livy-tee = { version = "0.1.1" , features = ["mock-tee", "ita-verify"]}
+livy-tee = { version = "0.1.1" , features = ["ita-verify"]}
 reqwest = "0.12.28"
 rmcp = {version ="1.7.0", features = ["server", "transport-streamable-http-server"]}
 serde = {version = "1.0.228" , features = ["derive"]}
