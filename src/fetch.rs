@@ -1,6 +1,7 @@
 //! Spider execution layer for product routes and receipts.
 
 use crate::errors::FetchError;
+use crate::provenance::{ProvenanceClient, ResolverFetchEvidence};
 use crate::types::{
     FetchWithReceipt, FormatSelection, ProductFormat, ProductMode, ProductProxy, ProductRequest,
     ProductResponse, ProductRoute, Receipt,
@@ -21,6 +22,7 @@ use std::{
 
 pub struct Fetcher {
     spider: Spider,
+    provenance: Option<ProvenanceClient>,
     receipts: Mutex<HashMap<String, Receipt>>,
     receipt_counter: AtomicU64,
 }
@@ -28,10 +30,15 @@ pub struct Fetcher {
 impl Fetcher {
     pub fn new() -> Self {
         dotenvy::dotenv().ok();
-        let key = std::env::var("LIVY_KEY").expect("LIVY_KEY must be set");
+        let key = std::env::var("SPIDER_API_KEY")
+            .or_else(|_| std::env::var("LIVY_KEY"))
+            .expect("SPIDER_API_KEY or LIVY_KEY must be set");
         let spider = Spider::new(Some(key)).expect("Can initiate fetcher service");
+        let provenance = ProvenanceClient::from_env()
+            .unwrap_or_else(|err| panic!("invalid provenance configuration: {err}"));
         Fetcher {
             spider,
+            provenance,
             receipts: Mutex::new(HashMap::new()),
             receipt_counter: AtomicU64::new(1),
         }
@@ -106,12 +113,18 @@ impl Fetcher {
             (None, None)
         };
 
+        let (provenance, provenance_error) = self
+            .provenance_for(&payload, route, mode, &data, receipt.as_ref())
+            .await;
+
         Ok(ProductResponse {
             route: route.as_str().to_string(),
             mode,
             receipt_id,
             receipt,
             data,
+            provenance,
+            provenance_error,
         })
     }
 
@@ -130,6 +143,8 @@ impl Fetcher {
             receipt_id: receipt.id.clone(),
             receipt: receipt.clone(),
             data: crawl,
+            provenance: response.provenance,
+            provenance_error: response.provenance_error,
         })
     }
 
@@ -146,6 +161,33 @@ impl Fetcher {
         self.product_fetch(payload, ProductRoute::Unblock)
             .await
             .map(|response| response.data)
+    }
+
+    async fn provenance_for(
+        &self,
+        payload: &ProductRequest,
+        route: ProductRoute,
+        mode: ProductMode,
+        data: &Value,
+        receipt: Option<&Receipt>,
+    ) -> (Option<crate::provenance::ProvenanceResult>, Option<String>) {
+        let Some(provenance) = self.provenance.as_ref() else {
+            return (None, None);
+        };
+
+        match provenance
+            .attest_fetch(ResolverFetchEvidence {
+                payload,
+                route,
+                mode,
+                data,
+                receipt,
+            })
+            .await
+        {
+            Ok(result) => (Some(result), None),
+            Err(err) => (None, Some(err.to_string())),
+        }
     }
 
     async fn scrape(

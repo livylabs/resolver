@@ -3,8 +3,9 @@ name: livy-resolver
 description: |
   Use this skill when configuring or working with the Livy Resolver MCP
   service in this repo. It explains how the resolver relates to MCP
-  clients, where `LIVY_KEY` must be configured, and how to use the
-  exact-source `fetch_source` tool and product HTTP routes.
+  clients, where Spider and Livy provenance keys must be configured, and
+  how to use the exact-source `fetch_source` tool and product HTTP
+  routes.
 ---
 
 # Livy Resolver
@@ -22,20 +23,20 @@ sources through Spider-backed Livy access. It exposes:
 The resolver requires:
 
 ```dotenv
-LIVY_KEY=your-livy-key
+SPIDER_API_KEY=your-spider-api-key
 ```
 
 This repo does not include an MCP config file yet. The code loads `.env`
-and then reads `LIVY_KEY` from the resolver process environment at
-startup.
+and then reads `SPIDER_API_KEY` from the resolver process environment at
+startup. `LIVY_KEY` is accepted as a legacy alias.
 
 Configure the key based on how MCP is wired:
 
-- If the MCP config launches this repo, put `LIVY_KEY` in that server
-  entry's `env`.
+- If the MCP config launches this repo, put `SPIDER_API_KEY` in that
+  server entry's `env`.
 - If the MCP client connects to an already-running
-  `http://localhost:3001/mcp`, configure `LIVY_KEY` where that server
-  process is started.
+  `http://localhost:3001/mcp`, configure `SPIDER_API_KEY` where that
+  server process is started.
 - For local manual runs, use a shell env var or local `.env`.
 
 Example launch config:
@@ -48,12 +49,52 @@ Example launch config:
       "args": ["run"],
       "cwd": "/path/to/resolver",
       "env": {
-        "LIVY_KEY": "your-livy-key"
+        "SPIDER_API_KEY": "your-spider-api-key"
       }
     }
   }
 }
 ```
+
+## Livy Provenance
+
+When enabled, successful resolver fetches also post Livy provenance
+attestations to the backend. The current proof is generic source-fetch
+provenance:
+
+- `attestation_claim=source`
+- `subject_type=resolver_fetch`
+- `schema_id=resolver-fetch-v1`
+- `integration_id=delphi` by default
+
+Do not use the `prediction_market_resolver` template unless the resolver
+is actually producing market-resolution outputs such as market id,
+outcome, confidence, dispute window, and settlement target.
+
+Configure provenance where the resolver process runs:
+
+```dotenv
+LIVY_PROVENANCE_ENABLED=true
+LIVY_BACKEND_BASE_URL=https://api.livylabs.xyz
+LIVY_API_KEY=livy_...
+LIVY_INTEGRATION_ID=delphi
+ITA_API_KEY=...
+```
+
+Optional:
+
+```dotenv
+LIVY_PROVENANCE_SCHEMA_ID=resolver-fetch-v1
+LIVY_PROVENANCE_SCHEMA_VERSION=1
+LIVY_PROVENANCE_VISIBILITY=public
+LIVY_PROVENANCE_VERIFICATION_MODE=verify_fresh
+LIVY_EXPLORER_BASE_URL=https://api.livylabs.xyz
+LIVY_PROVENANCE_BOOTSTRAP_TEMPLATE=false
+```
+
+Only set `LIVY_PROVENANCE_BOOTSTRAP_TEMPLATE=true` if the Livy API key
+has template write scope. Public explorer reads require the matching
+public template to exist in Livy.
 
 ## MCP Use
 
@@ -113,7 +154,9 @@ curl -s http://localhost:3001/fetch \
 
 - `src/main.rs`: mounts HTTP routes and `/mcp`
 - `src/mcp.rs`: defines `fetch_source`
-- `src/fetch.rs`: reads `LIVY_KEY`, calls Spider, stores receipts
+- `src/fetch.rs`: reads `SPIDER_API_KEY`, calls Spider, stores receipts
+- `src/provenance.rs`: builds and posts generic resolver source-fetch
+  attestations
 - `src/api.rs`: HTTP route handlers
 - `src/types.rs`: request/response types
 
