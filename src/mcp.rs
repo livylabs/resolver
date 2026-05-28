@@ -3,7 +3,8 @@
 use crate::fetch::Fetcher;
 use rmcp::{
     ErrorData, ServerHandler,
-    handler::server::wrapper::{Json, Parameters},
+    handler::server::wrapper::Parameters,
+    model::CallToolResult,
     schemars, tool, tool_handler, tool_router,
 };
 
@@ -34,14 +35,14 @@ impl Server {
     async fn fetch_source(
         &self,
         Parameters(Params { url }): Parameters<Params>,
-    ) -> Result<Json<serde_json::Value>, ErrorData> {
+    ) -> Result<CallToolResult, ErrorData> {
         let data = self
             .fetcher
             .get_fast_data_with_receipt(&url)
             .await
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
         serde_json::to_value(data)
-            .map(Json)
+            .map(CallToolResult::structured)
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))
     }
 }
