@@ -2,8 +2,9 @@
 
 use crate::fetch::Fetcher;
 use rmcp::{
-    ErrorData, ServerHandler, handler::server::wrapper::Parameters, schemars, tool, tool_handler,
-    tool_router,
+    ErrorData, ServerHandler,
+    handler::server::wrapper::{Json, Parameters},
+    schemars, tool, tool_handler, tool_router,
 };
 
 #[derive(serde::Deserialize, schemars::JsonSchema)]
@@ -33,11 +34,14 @@ impl Server {
     async fn fetch_source(
         &self,
         Parameters(Params { url }): Parameters<Params>,
-    ) -> Result<String, ErrorData> {
-        self.fetcher
+    ) -> Result<Json<serde_json::Value>, ErrorData> {
+        let data = self
+            .fetcher
             .get_fast_data_with_receipt(&url)
             .await
-            .and_then(|data| serde_json::to_string(&data).map_err(Into::into))
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+        serde_json::to_value(data)
+            .map(Json)
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))
     }
 }
