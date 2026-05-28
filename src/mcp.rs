@@ -1,12 +1,15 @@
 //! MCP tool wrapper for exact source fetching.
 
 use crate::fetch::Fetcher;
+use crate::types::FetchWithReceipt;
 use rmcp::{
     ErrorData, ServerHandler,
     handler::server::wrapper::Parameters,
-    model::CallToolResult,
+    model::{CallToolResult, Content},
     schemars, tool, tool_handler, tool_router,
 };
+use serde_json::Value;
+use std::{fmt::Write, time::Instant};
 
 #[derive(serde::Deserialize, schemars::JsonSchema)]
 pub struct Params {
@@ -36,15 +39,70 @@ impl Server {
         &self,
         Parameters(Params { url }): Parameters<Params>,
     ) -> Result<CallToolResult, ErrorData> {
+        let started = Instant::now();
+        eprintln!("mcp fetch_source start url={url}");
+
         let data = self
             .fetcher
             .get_fast_data_with_receipt(&url)
             .await
-            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
-        serde_json::to_value(data)
-            .map(CallToolResult::structured)
-            .map_err(|e| ErrorData::internal_error(e.to_string(), None))
+            .map_err(|e| {
+                eprintln!(
+                    "mcp fetch_source error elapsed_ms={} error={e}",
+                    started.elapsed().as_millis()
+                );
+                ErrorData::internal_error(e.to_string(), None)
+            })?;
+
+        let text = render_fetch_result(&data);
+        eprintln!(
+            "mcp fetch_source ok elapsed_ms={} response_bytes={}",
+            started.elapsed().as_millis(),
+            text.len()
+        );
+        Ok(CallToolResult::success(vec![Content::text(text)]))
     }
+}
+
+fn render_fetch_result(data: &FetchWithReceipt) -> String {
+    let mut output = String::new();
+    let receipt = &data.receipt;
+
+    let _ = writeln!(output, "receipt_id: {}", data.receipt_id);
+    let _ = writeln!(output, "status: {}", display_option(receipt.status));
+    let _ = writeln!(
+        output,
+        "fetch_elapsed_ms: {}",
+        display_option(receipt.duration_elapsed_ms)
+    );
+    let _ = writeln!(
+        output,
+        "content_bytes: {}",
+        display_option(receipt.content_bytes)
+    );
+    output.push_str("\n---\n\n");
+    match extracted_content(&data.data) {
+        Some(content) => output.push_str(content),
+        None => output.push_str(&data.data.to_string()),
+    }
+
+    output
+}
+
+fn display_option<T: std::fmt::Display>(value: Option<T>) -> String {
+    value
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+fn extracted_content(data: &Value) -> Option<&str> {
+    if let Some(content) = data.get("content").and_then(Value::as_str) {
+        return Some(content);
+    }
+
+    data.as_array()?
+        .iter()
+        .find_map(|item| item.get("content").and_then(Value::as_str))
 }
 
 #[tool_handler(
