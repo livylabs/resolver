@@ -957,11 +957,13 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "dotenvy",
+ "hex",
  "livy-tee",
  "reqwest",
  "rmcp",
  "serde",
  "serde_json",
+ "sha2",
  "spider-client",
  "thiserror 2.0.18",
  "tokio",

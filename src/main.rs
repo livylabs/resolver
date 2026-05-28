@@ -4,6 +4,7 @@ mod api;
 mod errors;
 mod fetch;
 mod mcp;
+mod provenance;
 mod types;
 use api::{
     crawl_post, extract_post, fetch_fast, fetch_post, fetch_unblock, get_receipt, map_post,
@@ -42,10 +43,15 @@ async fn main() -> Result<()> {
         .route("/fetchunblock", post(fetch_unblock))
         .route("/receipt/{id}", get(get_receipt))
         .route("/recipt/{id}", get(get_receipt))
+        .route("/healthz", get(|| async { "ok" }))
         .nest_service("/mcp", mcp_service)
         .with_state(fetcher);
 
-    let listener = tokio::net::TcpListener::bind("0.0.0.0:3001")
+    let port = std::env::var("PORT")
+        .or_else(|_| std::env::var("RESOLVER_PORT"))
+        .unwrap_or_else(|_| "3001".to_string());
+    let addr = format!("0.0.0.0:{port}");
+    let listener = tokio::net::TcpListener::bind(&addr)
         .await
         .map_err(|err| FetchError::Http(err.to_string()))?;
 

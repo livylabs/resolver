@@ -1,5 +1,6 @@
 //! Product-facing request, route, mode, and receipt types.
 
+use crate::provenance::ProvenanceResult;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
@@ -306,7 +307,7 @@ impl ProductRoute {
 }
 
 /// In-memory provenance metadata for receipt-backed requests.
-#[derive(Clone, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 pub struct Receipt {
     /// Receipt identifier.
     pub id: String,
@@ -343,6 +344,12 @@ pub struct FetchWithReceipt {
     pub receipt: Receipt,
     /// Upstream payload.
     pub data: Value,
+    /// Livy provenance record when provenance is enabled and succeeded.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provenance: Option<ProvenanceResult>,
+    /// Livy provenance failure when fetching succeeded but attestation failed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provenance_error: Option<String>,
 }
 
 /// Product route response envelope.
@@ -358,4 +365,10 @@ pub struct ProductResponse {
     pub receipt: Option<Receipt>,
     /// Upstream payload.
     pub data: Value,
+    /// Livy provenance record when provenance is enabled and succeeded.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provenance: Option<ProvenanceResult>,
+    /// Livy provenance failure when fetching succeeded but attestation failed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provenance_error: Option<String>,
 }
