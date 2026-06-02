@@ -2,6 +2,7 @@
 
 use crate::errors::FetchError;
 use crate::provenance::{ProvenanceClient, ResolverFetchEvidence};
+use crate::snapshot_upload::SnapshotPayload;
 use crate::types::{
     FetchWithReceipt, FormatSelection, ProductFormat, ProductMode, ProductProxy, ProductRequest,
     ProductResponse, ProductRoute, Receipt,
@@ -147,6 +148,27 @@ impl Fetcher {
             provenance: response.provenance,
             provenance_error: response.provenance_error,
         })
+    }
+
+    pub async fn snapshot_with_receipt(&self, source: &str) -> Result<SnapshotPayload, FetchError> {
+        let formats = HashSet::from([ReturnFormat::Raw, ReturnFormat::Screenshot]);
+        let params = RequestParams {
+            return_format: Some(ReturnFormatHandling::Multi(formats)),
+            request: Some(RequestType::SmartMode),
+            stealth: Some(true),
+            fingerprint: Some(true),
+            proxy_enabled: Some(true),
+            ..Default::default()
+        };
+
+        let data = self
+            .spider
+            .scrape_url(source, Some(params), "application/json")
+            .await
+            .map_err(FetchError::UnableFetch)?;
+        let crawl = Self::normalize_value(data)?;
+
+        SnapshotPayload::from_spider_response(source, crawl).map_err(FetchError::Snapshot)
     }
 
     pub async fn unblocker(&self, source: &str) -> Result<serde_json::Value, FetchError> {

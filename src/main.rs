@@ -5,10 +5,11 @@ mod errors;
 mod fetch;
 mod mcp;
 mod provenance;
+mod snapshot_upload;
 mod types;
 use api::{
     crawl_post, extract_post, fetch_fast, fetch_post, fetch_unblock, get_receipt, map_post,
-    screenshot_post, search_post,
+    screenshot_post, search_post, snapshot_source,
 };
 use axum::{
     Router,
@@ -39,6 +40,7 @@ async fn main() -> Result<()> {
         .route("/search", post(search_post))
         .route("/extract", post(extract_post))
         .route("/screenshot", post(screenshot_post))
+        .route("/snapshot", post(snapshot_source))
         .route("/fetchfast", post(fetch_fast))
         .route("/fetchunblock", post(fetch_unblock))
         .route("/receipt/{id}", get(get_receipt))

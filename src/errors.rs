@@ -1,5 +1,6 @@
 //! HTTP error mapping for product and upstream failures.
 
+use crate::snapshot_upload::SnapshotError;
 use axum::{
     http::StatusCode,
     response::{IntoResponse, Json, Response},
@@ -25,6 +26,8 @@ pub enum FetchError {
     NotFound(String),
     #[error("Bad request")]
     BadRequest(String),
+    #[error("Snapshot failed")]
+    Snapshot(#[from] SnapshotError),
 }
 
 impl IntoResponse for FetchError {
@@ -49,6 +52,7 @@ impl IntoResponse for FetchError {
             ),
             FetchError::NotFound(e) => (StatusCode::NOT_FOUND, e),
             FetchError::BadRequest(e) => (StatusCode::BAD_REQUEST, e),
+            FetchError::Snapshot(e) => (StatusCode::BAD_REQUEST, format!("Snapshot failed {}", e)),
         };
 
         let body = Json(json!({
