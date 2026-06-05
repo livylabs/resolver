@@ -7,7 +7,6 @@ use axum::{
 
 use crate::errors::FetchError;
 use crate::fetch::Fetcher;
-use crate::snapshot_upload::{spawn_snapshot_payload_upload, spawn_snapshot_upload};
 use crate::types::{FetchWithReceipt, ProductRequest, ProductResponse, ProductRoute, Receipt};
 use serde::Deserialize;
 use serde_json::Value;
@@ -22,11 +21,7 @@ pub async fn fetch_post(
     State(fetcher): State<Arc<Fetcher>>,
     Json(payload): Json<ProductRequest>,
 ) -> Result<Json<ProductResponse>, FetchError> {
-    let source = payload.source.clone();
     let data = fetcher.product_fetch(payload, ProductRoute::Scrape).await?;
-    if let Some(source) = source {
-        spawn_snapshot_upload(fetcher, source);
-    }
     Ok(Json(data))
 }
 
@@ -97,7 +92,6 @@ pub async fn snapshot_source(
     Json(payload): Json<FetchRequest>,
 ) -> Result<Json<crate::snapshot_upload::SnapshotPayload>, FetchError> {
     let snapshot = fetcher.snapshot_with_receipt(&payload.source).await?;
-    spawn_snapshot_payload_upload(snapshot.clone());
     Ok(Json(snapshot))
 }
 
