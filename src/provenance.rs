@@ -7,8 +7,9 @@ use crate::types::{
 use livy_provenance_sdk::{
     CreateProvenanceAttestationRequest, DEFAULT_LIVY_API_BASE_URL, ProvenanceAttestationField,
     ProvenanceClient as LivyProvenanceApiClient, ProvenanceClientConfig, ProvenanceClientError,
-    ProvenanceCommitMode, ProvenanceFieldDisclosure, ProvenanceTemplateField,
-    ProvenanceVerificationMode, UpsertProvenanceTemplateRequest,
+    ProvenanceCommitMode, ProvenanceFieldDisclosure, ProvenanceManagedPublicationRequest,
+    ProvenanceRegistryRefResponse, ProvenanceTemplateField, ProvenanceVerificationMode,
+    RegistryRefWaitOptions, UpsertProvenanceTemplateRequest,
 };
 use livy_tee::Livy;
 use serde::{Deserialize, Serialize};
@@ -17,7 +18,7 @@ use sha2::{Digest, Sha256};
 use std::{
     fmt,
     sync::atomic::{AtomicBool, Ordering},
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 const DEFAULT_SCHEMA_ID: &str = "resolver-fetch-v1";
@@ -46,6 +47,10 @@ struct ProvenanceConfig {
     subject_prefix: String,
     program_id: Option<String>,
     bootstrap_template: bool,
+    managed_publication: bool,
+    wait_for_registry_refs: bool,
+    registry_wait_attempts: u32,
+    registry_wait_interval_ms: u64,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -60,7 +65,62 @@ pub struct ProvenanceResult {
     pub report_payload_hash: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub explorer_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub managed_publication: Option<Value>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub registry_refs: Vec<ProvenanceRegistryRef>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub registry_ref_poll_error: Option<String>,
     pub data_sha256: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ProvenanceRegistryRef {
+    pub registry_kind: String,
+    pub provider: String,
+    pub chain_family: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chain_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub network: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub registry_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub registry_address: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub transaction_hash: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub block_number: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub attestation_key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub arweave_location: Option<String>,
+    pub status: String,
+    #[serde(default)]
+    pub explorer_links: Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub registered_at: Option<String>,
+}
+
+impl From<&ProvenanceRegistryRefResponse> for ProvenanceRegistryRef {
+    fn from(record: &ProvenanceRegistryRefResponse) -> Self {
+        Self {
+            registry_kind: record.registry_kind.clone(),
+            provider: record.provider.clone(),
+            chain_family: record.chain_family.clone(),
+            chain_id: record.chain_id.clone(),
+            network: record.network.clone(),
+            registry_name: record.registry_name.clone(),
+            registry_address: record.registry_address.clone(),
+            transaction_hash: record.transaction_hash.clone(),
+            block_number: record.block_number,
+            attestation_key: record.attestation_key.clone(),
+            arweave_location: record.arweave_location.clone(),
+            status: record.status.clone(),
+            explorer_links: record.explorer_links.clone(),
+            registered_at: record.registered_at.clone(),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -132,6 +192,13 @@ impl ProvenanceClient {
         let explorer_base_url = optional_env("LIVY_EXPLORER_BASE_URL");
         let program_id = optional_env("LIVY_RESOLVER_PROGRAM_ID");
         let bootstrap_template = env_bool("LIVY_PROVENANCE_BOOTSTRAP_TEMPLATE")?.unwrap_or(false);
+        let managed_publication = env_bool("LIVY_PROVENANCE_MANAGED_PUBLICATION")?.unwrap_or(true);
+        let wait_for_registry_refs =
+            env_bool("LIVY_PROVENANCE_WAIT_FOR_REGISTRY_REFS")?.unwrap_or(false);
+        let registry_wait_attempts =
+            env_u32("LIVY_PROVENANCE_REGISTRY_WAIT_ATTEMPTS")?.unwrap_or(30);
+        let registry_wait_interval_ms =
+            env_u64("LIVY_PROVENANCE_REGISTRY_WAIT_INTERVAL_MS")?.unwrap_or(2_000);
 
         if !matches!(visibility.as_str(), "public" | "private") {
             return Err(ProvenanceError::InvalidEnv(
@@ -157,6 +224,10 @@ impl ProvenanceClient {
                 subject_prefix,
                 program_id,
                 bootstrap_template,
+                managed_publication,
+                wait_for_registry_refs,
+                registry_wait_attempts,
+                registry_wait_interval_ms,
             },
             api,
             livy,
@@ -246,7 +317,36 @@ impl ProvenanceClient {
             }),
         };
 
-        let record = self.api.create_attestation(request).await?;
+        let mut record = if self.config.managed_publication {
+            let publish = managed_publication_request(
+                &request.subject_id,
+                evidence.route,
+                evidence.mode,
+                receipt_id.as_deref(),
+            );
+            self.api
+                .create_attestation_with_publication(request, publish)
+                .await?
+        } else {
+            self.api.create_attestation(request).await?
+        };
+        let mut registry_ref_poll_error = None;
+        if self.config.managed_publication && self.config.wait_for_registry_refs {
+            match self
+                .api
+                .wait_for_registry_refs(
+                    &record.provenance_attestation_id,
+                    RegistryRefWaitOptions::new(
+                        self.config.registry_wait_attempts,
+                        Duration::from_millis(self.config.registry_wait_interval_ms),
+                    ),
+                )
+                .await
+            {
+                Ok(published) => record = published,
+                Err(err) => registry_ref_poll_error = Some(err.to_string()),
+            }
+        }
 
         Ok(ProvenanceResult {
             provenance_attestation_id: record.provenance_attestation_id.clone(),
@@ -262,6 +362,13 @@ impl ProvenanceClient {
             public_values_commitment: record.public_values_commitment,
             report_payload_hash: record.report_payload_hash,
             explorer_url: self.explorer_url(&record.provenance_attestation_id),
+            managed_publication: record.metadata.get("managed_publication").cloned(),
+            registry_refs: record
+                .registry_refs
+                .iter()
+                .map(ProvenanceRegistryRef::from)
+                .collect(),
+            registry_ref_poll_error,
             data_sha256,
         })
     }
@@ -407,6 +514,24 @@ impl ProvenanceClient {
             "{base}/api/v1/public/provenance/attestations/{provenance_attestation_id}"
         ))
     }
+}
+
+fn managed_publication_request(
+    subject_id: &str,
+    route: ProductRoute,
+    mode: ProductMode,
+    receipt_id: Option<&str>,
+) -> ProvenanceManagedPublicationRequest {
+    ProvenanceManagedPublicationRequest::livy_managed_registry()
+        .with_livy_explorer_id(subject_id)
+        .with_metadata(json!({
+            "application_domain": APPLICATION_DOMAIN,
+            "resolver_service": "livy-resolver",
+            "resolver_version": env!("CARGO_PKG_VERSION"),
+            "route": route.as_str(),
+            "mode": mode_label(mode),
+            "receipt_id": receipt_id,
+        }))
 }
 
 pub(crate) fn request_summary(
@@ -777,6 +902,26 @@ fn env_bool(name: &str) -> Result<Option<bool>, ProvenanceError> {
     }
 }
 
+fn env_u32(name: &str) -> Result<Option<u32>, ProvenanceError> {
+    optional_env(name)
+        .map(|value| {
+            value.parse::<u32>().map_err(|_| {
+                ProvenanceError::InvalidEnv(format!("{name} must be an unsigned integer"))
+            })
+        })
+        .transpose()
+}
+
+fn env_u64(name: &str) -> Result<Option<u64>, ProvenanceError> {
+    optional_env(name)
+        .map(|value| {
+            value.parse::<u64>().map_err(|_| {
+                ProvenanceError::InvalidEnv(format!("{name} must be an unsigned integer"))
+            })
+        })
+        .transpose()
+}
+
 fn parse_verification_mode(value: &str) -> Result<ProvenanceVerificationMode, ProvenanceError> {
     match value.trim().to_ascii_lowercase().as_str() {
         "binding_only" => Ok(ProvenanceVerificationMode::BindingOnly),
@@ -858,5 +1003,53 @@ mod tests {
             configured_backend_base_url(Some("http://localhost:8081///".to_string())),
             "http://localhost:8081"
         );
+    }
+
+    #[test]
+    fn managed_publication_request_targets_livy_registry() {
+        let request = managed_publication_request(
+            "resolver_fetch:abc123",
+            ProductRoute::Scrape,
+            ProductMode::Fast,
+            Some("receipt-1"),
+        );
+        let value = serde_json::to_value(request).unwrap();
+
+        assert_eq!(value["arweave"], true);
+        assert_eq!(value["registry"], true);
+        assert_eq!(value["livy_explorer_id"], "resolver_fetch:abc123");
+        assert_eq!(value["metadata"]["application_domain"], APPLICATION_DOMAIN);
+        assert_eq!(value["metadata"]["route"], "fetch");
+        assert_eq!(value["metadata"]["mode"], "fast");
+        assert_eq!(value["metadata"]["receipt_id"], "receipt-1");
+    }
+
+    #[test]
+    fn registry_ref_response_is_serializable_for_fetch_response() {
+        let sdk_ref: ProvenanceRegistryRefResponse = serde_json::from_value(json!({
+            "registry_kind": "livy_attestation_registry",
+            "provider": "evm-attestation-registry",
+            "chain_family": "evm",
+            "chain_id": "685685",
+            "network": "gensyn-testnet",
+            "registry_name": "Livy Attestation Registry",
+            "registry_address": "0x0000000000000000000000000000000000000001",
+            "transaction_hash": "0xabc",
+            "block_number": 12,
+            "attestation_key": "0xdef",
+            "arweave_location": "ar://receipt",
+            "status": "registered",
+            "explorer_links": {"transaction": "https://example.test/tx/0xabc"},
+            "registered_at": "2026-06-08T00:00:00Z"
+        }))
+        .unwrap();
+
+        let response_ref = ProvenanceRegistryRef::from(&sdk_ref);
+        let encoded = serde_json::to_value(response_ref).unwrap();
+
+        assert_eq!(encoded["chain_family"], "evm");
+        assert_eq!(encoded["chain_id"], "685685");
+        assert_eq!(encoded["status"], "registered");
+        assert_eq!(encoded["arweave_location"], "ar://receipt");
     }
 }

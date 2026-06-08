@@ -58,6 +58,10 @@ LIVY_PROVENANCE_VISIBILITY=public
 LIVY_PROVENANCE_VERIFICATION_MODE=verify_fresh
 LIVY_EXPLORER_BASE_URL=https://api.livylabs.xyz
 LIVY_PROVENANCE_BOOTSTRAP_TEMPLATE=false
+LIVY_PROVENANCE_MANAGED_PUBLICATION=true
+LIVY_PROVENANCE_WAIT_FOR_REGISTRY_REFS=false
+LIVY_PROVENANCE_REGISTRY_WAIT_ATTEMPTS=30
+LIVY_PROVENANCE_REGISTRY_WAIT_INTERVAL_MS=2000
 ```
 
 `LIVY_BACKEND_BASE_URL` defaults to `https://api.livylabs.xyz`; set it for local or staging backends.
@@ -65,6 +69,13 @@ LIVY_PROVENANCE_BOOTSTRAP_TEMPLATE=false
 Set `LIVY_PROVENANCE_BOOTSTRAP_TEMPLATE=true` only when the API key is
 allowed to write provenance templates. Public explorer reads also require
 the matching public template to exist in Livy.
+
+`LIVY_PROVENANCE_MANAGED_PUBLICATION=true` asks Livy backend to publish the
+provenance receipt to Arweave and register it on the configured EVM registry.
+The resolver still returns the attestation immediately. Set
+`LIVY_PROVENANCE_WAIT_FOR_REGISTRY_REFS=true` only when the caller should wait
+for public `registry_refs`; that mode requires the API key to have provenance
+read access in addition to write access.
 
 ## HTTP API
 
@@ -83,7 +94,11 @@ Response shape:
     "schema_id": "resolver-fetch-v1",
     "verification_status": "verified",
     "schema_binding_status": "full",
-    "explorer_url": "..."
+    "explorer_url": "...",
+    "managed_publication": {
+      "status": "publishing"
+    },
+    "registry_refs": []
   }
 }
 ```
