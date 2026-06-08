@@ -4,8 +4,13 @@ use crate::types::{
     FormatSelection, ProductFormat, ProductMode, ProductProxy, ProductRequest, ProductRoute,
     Receipt,
 };
+use livy_provenance_sdk::{
+    CreateProvenanceAttestationRequest, DEFAULT_LIVY_API_BASE_URL, ProvenanceAttestationField,
+    ProvenanceClient as LivyProvenanceApiClient, ProvenanceClientConfig, ProvenanceClientError,
+    ProvenanceCommitMode, ProvenanceFieldDisclosure, ProvenanceTemplateField,
+    ProvenanceVerificationMode, UpsertProvenanceTemplateRequest,
+};
 use livy_tee::Livy;
-use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -25,7 +30,7 @@ const ATTESTATION_CLAIM: &str = "source";
 #[derive(Debug)]
 pub struct ProvenanceClient {
     config: ProvenanceConfig,
-    http: reqwest::Client,
+    api: LivyProvenanceApiClient,
     livy: Livy,
     template_ready: AtomicBool,
 }
@@ -34,12 +39,10 @@ pub struct ProvenanceClient {
 struct ProvenanceConfig {
     backend_base_url: String,
     explorer_base_url: Option<String>,
-    api_key: String,
-    integration_id: String,
     schema_id: String,
     schema_version: String,
     visibility: String,
-    verification_mode: String,
+    verification_mode: ProvenanceVerificationMode,
     subject_prefix: String,
     program_id: Option<String>,
     bootstrap_template: bool,
@@ -64,10 +67,9 @@ pub struct ProvenanceResult {
 pub enum ProvenanceError {
     MissingEnv(&'static str),
     InvalidEnv(String),
-    Http(reqwest::Error),
+    Sdk(ProvenanceClientError),
     Json(serde_json::Error),
     Attestation(String),
-    Backend(String),
     Time(String),
 }
 
@@ -76,10 +78,9 @@ impl fmt::Display for ProvenanceError {
         match self {
             Self::MissingEnv(name) => write!(f, "{name} must be set when provenance is enabled"),
             Self::InvalidEnv(message) => write!(f, "invalid provenance configuration: {message}"),
-            Self::Http(err) => write!(f, "provenance HTTP request failed: {err}"),
+            Self::Sdk(err) => write!(f, "provenance SDK failed: {err}"),
             Self::Json(err) => write!(f, "provenance JSON handling failed: {err}"),
             Self::Attestation(err) => write!(f, "provenance attestation failed: {err}"),
-            Self::Backend(err) => write!(f, "provenance backend rejected the record: {err}"),
             Self::Time(err) => write!(f, "provenance timestamp failed: {err}"),
         }
     }
@@ -87,9 +88,9 @@ impl fmt::Display for ProvenanceError {
 
 impl std::error::Error for ProvenanceError {}
 
-impl From<reqwest::Error> for ProvenanceError {
-    fn from(err: reqwest::Error) -> Self {
-        Self::Http(err)
+impl From<ProvenanceClientError> for ProvenanceError {
+    fn from(err: ProvenanceClientError) -> Self {
+        Self::Sdk(err)
     }
 }
 
@@ -108,16 +109,6 @@ pub struct ResolverFetchEvidence<'a> {
     pub receipt: Option<&'a Receipt>,
 }
 
-#[derive(Debug, Deserialize)]
-struct ProvenanceRecordResponse {
-    provenance_attestation_id: String,
-    subject_id: String,
-    verification_status: String,
-    schema_binding_status: String,
-    public_values_commitment: String,
-    report_payload_hash: String,
-}
-
 impl ProvenanceClient {
     pub fn from_env() -> Result<Option<Self>, ProvenanceError> {
         let configured = env_present("LIVY_BACKEND_BASE_URL")
@@ -129,13 +120,14 @@ impl ProvenanceClient {
             return Ok(None);
         }
 
-        let backend_base_url = required_env("LIVY_BACKEND_BASE_URL")?;
+        let backend_base_url = backend_base_url_from_env();
         let api_key = required_env("LIVY_API_KEY")?;
         let integration_id = env_or("LIVY_INTEGRATION_ID", DEFAULT_INTEGRATION_ID);
         let schema_id = env_or("LIVY_PROVENANCE_SCHEMA_ID", DEFAULT_SCHEMA_ID);
         let schema_version = env_or("LIVY_PROVENANCE_SCHEMA_VERSION", DEFAULT_SCHEMA_VERSION);
         let visibility = env_or("LIVY_PROVENANCE_VISIBILITY", "public");
-        let verification_mode = env_or("LIVY_PROVENANCE_VERIFICATION_MODE", "verify_fresh");
+        let verification_mode =
+            parse_verification_mode(&env_or("LIVY_PROVENANCE_VERIFICATION_MODE", "verify_fresh"))?;
         let subject_prefix = env_or("LIVY_PROVENANCE_SUBJECT_PREFIX", SUBJECT_TYPE);
         let explorer_base_url = optional_env("LIVY_EXPLORER_BASE_URL");
         let program_id = optional_env("LIVY_RESOLVER_PROGRAM_ID");
@@ -148,13 +140,16 @@ impl ProvenanceClient {
         }
 
         let livy = Livy::from_env().map_err(|err| ProvenanceError::InvalidEnv(err.to_string()))?;
+        let api = LivyProvenanceApiClient::new(ProvenanceClientConfig::with_base_url(
+            backend_base_url.clone(),
+            api_key,
+            integration_id,
+        ))?;
 
         Ok(Some(Self {
             config: ProvenanceConfig {
-                backend_base_url: trim_trailing_slash(&backend_base_url),
+                backend_base_url,
                 explorer_base_url: explorer_base_url.map(|value| trim_trailing_slash(&value)),
-                api_key,
-                integration_id,
                 schema_id,
                 schema_version,
                 visibility,
@@ -163,7 +158,7 @@ impl ProvenanceClient {
                 program_id,
                 bootstrap_template,
             },
-            http: reqwest::Client::new(),
+            api,
             livy,
             template_ready: AtomicBool::new(false),
         }))
@@ -227,18 +222,17 @@ impl ProvenanceClient {
             receipt_id.as_deref(),
         );
 
-        let request = json!({
-            "integration_id": self.config.integration_id,
-            "attestation_claim": ATTESTATION_CLAIM,
-            "subject_type": SUBJECT_TYPE,
-            "subject_id": subject_id,
-            "schema_id": self.config.schema_id,
-            "schema_version": self.config.schema_version,
-            "visibility": self.config.visibility,
-            "verification_mode": self.config.verification_mode,
-            "attestation": attestation,
-            "fields": fields,
-            "metadata": {
+        let request = CreateProvenanceAttestationRequest {
+            attestation_claim: ATTESTATION_CLAIM.to_string(),
+            subject_type: SUBJECT_TYPE.to_string(),
+            subject_id,
+            schema_id: Some(self.config.schema_id.clone()),
+            schema_version: Some(self.config.schema_version.clone()),
+            visibility: self.config.visibility.clone(),
+            verification_mode: Some(self.config.verification_mode),
+            attestation: serde_json::to_value(attestation)?,
+            fields,
+            metadata: json!({
                 "application_domain": APPLICATION_DOMAIN,
                 "resolver_service": "livy-resolver",
                 "resolver_version": env!("CARGO_PKG_VERSION"),
@@ -249,26 +243,20 @@ impl ProvenanceClient {
                 "output_sha256": data_sha256,
                 "output_commitment_sha256": sha256_json_hex(&output_commitment)?,
                 "receipt_id": receipt_id,
-            },
-        });
+            }),
+        };
 
-        let record: ProvenanceRecordResponse = self
-            .http
-            .post(self.endpoint("/api/v1/provenance/attestations"))
-            .headers(self.headers()?)
-            .json(&request)
-            .send()
-            .await?
-            .error_for_status()
-            .map_err(ProvenanceError::Http)?
-            .json()
-            .await?;
+        let record = self.api.create_attestation(request).await?;
 
         Ok(ProvenanceResult {
             provenance_attestation_id: record.provenance_attestation_id.clone(),
             subject_id: record.subject_id,
-            schema_id: self.config.schema_id.clone(),
-            schema_version: self.config.schema_version.clone(),
+            schema_id: record
+                .schema_id
+                .unwrap_or_else(|| self.config.schema_id.clone()),
+            schema_version: record
+                .schema_version
+                .unwrap_or_else(|| self.config.schema_version.clone()),
             verification_status: record.verification_status,
             schema_binding_status: record.schema_binding_status,
             public_values_commitment: record.public_values_commitment,
@@ -307,37 +295,55 @@ impl ProvenanceClient {
         mode: ProductMode,
         fetched_at_unix_ms: u64,
         receipt_id: Option<&str>,
-    ) -> Vec<Value> {
+    ) -> Vec<ProvenanceAttestationField> {
         let mut fields = vec![
             schema_field(
                 0,
                 "application_domain",
-                "json",
+                ProvenanceCommitMode::Json,
                 json!(APPLICATION_DOMAIN),
                 true,
             ),
-            schema_field(1, "subject_id", "json", json!(subject_id), true),
+            schema_field(
+                1,
+                "subject_id",
+                ProvenanceCommitMode::Json,
+                json!(subject_id),
+                true,
+            ),
             schema_field(
                 2,
                 "input_commitment",
-                "json_sha256",
+                ProvenanceCommitMode::JsonSha256,
                 input_commitment.clone(),
                 true,
             ),
             schema_field(
                 3,
                 "output_commitment",
-                "json_sha256",
+                ProvenanceCommitMode::JsonSha256,
                 output_commitment.clone(),
                 true,
             ),
-            schema_field(4, "source", "json", json!(source), true),
-            schema_field(5, "route", "json", json!(route.as_str()), true),
-            schema_field(6, "mode", "json", json!(mode_label(mode)), true),
+            schema_field(4, "source", ProvenanceCommitMode::Json, json!(source), true),
+            schema_field(
+                5,
+                "route",
+                ProvenanceCommitMode::Json,
+                json!(route.as_str()),
+                true,
+            ),
+            schema_field(
+                6,
+                "mode",
+                ProvenanceCommitMode::Json,
+                json!(mode_label(mode)),
+                true,
+            ),
             schema_field(
                 7,
                 "fetched_at_unix_ms",
-                "json",
+                ProvenanceCommitMode::Json,
                 json!(fetched_at_unix_ms),
                 true,
             ),
@@ -346,7 +352,7 @@ impl ProvenanceClient {
             fields.push(schema_field(
                 8,
                 "receipt_id",
-                "json",
+                ProvenanceCommitMode::Json,
                 json!(receipt_id),
                 false,
             ));
@@ -355,7 +361,7 @@ impl ProvenanceClient {
             fields.push(schema_field(
                 9,
                 "program_id",
-                "json",
+                ProvenanceCommitMode::Json,
                 json!(program_id),
                 false,
             ));
@@ -368,58 +374,27 @@ impl ProvenanceClient {
             return Ok(());
         }
 
-        let request = json!({
-            "integration_id": self.config.integration_id,
-            "schema_id": self.config.schema_id,
-            "schema_version": self.config.schema_version,
-            "attestation_claim": ATTESTATION_CLAIM,
-            "subject_type": SUBJECT_TYPE,
-            "name": "Resolver fetch",
-            "template_kind": "resolver_source",
-            "description": "Generic Livy resolver source-fetch proof. Use a separate prediction-market template only when the resolver emits market outcome fields.",
-            "visibility": self.config.visibility,
-            "fields": resolver_template_fields(),
-            "metadata": {
+        let request = UpsertProvenanceTemplateRequest {
+            schema_id: self.config.schema_id.clone(),
+            schema_version: self.config.schema_version.clone(),
+            attestation_claim: ATTESTATION_CLAIM.to_string(),
+            subject_type: SUBJECT_TYPE.to_string(),
+            name: "Resolver fetch".to_string(),
+            template_kind: "resolver_source".to_string(),
+            description: "Generic Livy resolver source-fetch proof. Use a separate prediction-market template only when the resolver emits market outcome fields.".to_string(),
+            visibility: self.config.visibility.clone(),
+            fields: resolver_template_fields(),
+            metadata: json!({
                 "application_domain": APPLICATION_DOMAIN,
                 "resolver_service": "livy-resolver",
                 "resolver_version": env!("CARGO_PKG_VERSION"),
-            },
-        });
+            }),
+        };
 
-        let response = self
-            .http
-            .post(self.endpoint("/api/v1/provenance/templates"))
-            .headers(self.headers()?)
-            .json(&request)
-            .send()
-            .await?;
-
-        if !response.status().is_success() {
-            let status = response.status();
-            let body = response.text().await.unwrap_or_default();
-            return Err(ProvenanceError::Backend(format!(
-                "template bootstrap returned {status}: {body}"
-            )));
-        }
+        self.api.upsert_template(request).await?;
 
         self.template_ready.store(true, Ordering::Release);
         Ok(())
-    }
-
-    fn endpoint(&self, path: &str) -> String {
-        format!("{}{}", self.config.backend_base_url, path)
-    }
-
-    fn headers(&self) -> Result<HeaderMap, ProvenanceError> {
-        let mut headers = HeaderMap::new();
-        let auth = HeaderValue::from_str(&format!("Bearer {}", self.config.api_key))
-            .map_err(|err| ProvenanceError::InvalidEnv(err.to_string()))?;
-        let integration = HeaderValue::from_str(&self.config.integration_id)
-            .map_err(|err| ProvenanceError::InvalidEnv(err.to_string()))?;
-        headers.insert(AUTHORIZATION, auth);
-        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-        headers.insert("x-integration-id", integration);
-        Ok(headers)
     }
 
     fn explorer_url(&self, provenance_attestation_id: &str) -> Option<String> {
@@ -559,23 +534,29 @@ fn nonce_from_subject(subject_id: &str) -> u64 {
     ])
 }
 
-fn schema_field(index: u32, name: &str, commit_mode: &str, value: Value, required: bool) -> Value {
-    json!({
-        "index": index,
-        "name": name,
-        "commit_mode": commit_mode,
-        "value": value,
-        "required": required,
-    })
+fn schema_field(
+    index: u32,
+    name: &str,
+    commit_mode: ProvenanceCommitMode,
+    value: Value,
+    required: bool,
+) -> ProvenanceAttestationField {
+    ProvenanceAttestationField {
+        index,
+        name: name.to_string(),
+        commit_mode,
+        value,
+        required,
+    }
 }
 
-fn resolver_template_fields() -> Vec<Value> {
+fn resolver_template_fields() -> Vec<ProvenanceTemplateField> {
     vec![
         template_field(
             0,
             "application_domain",
-            "json",
-            "public",
+            ProvenanceCommitMode::Json,
+            ProvenanceFieldDisclosure::Public,
             true,
             "string",
             "Static application domain for resolver proofs.",
@@ -583,8 +564,8 @@ fn resolver_template_fields() -> Vec<Value> {
         template_field(
             1,
             "subject_id",
-            "json",
-            "public",
+            ProvenanceCommitMode::Json,
+            ProvenanceFieldDisclosure::Public,
             true,
             "string",
             "Unique resolver fetch subject.",
@@ -592,8 +573,8 @@ fn resolver_template_fields() -> Vec<Value> {
         template_field(
             2,
             "input_commitment",
-            "json_sha256",
-            "commitment",
+            ProvenanceCommitMode::JsonSha256,
+            ProvenanceFieldDisclosure::Commitment,
             true,
             "object",
             "Redacted request summary committed by hash.",
@@ -601,8 +582,8 @@ fn resolver_template_fields() -> Vec<Value> {
         template_field(
             3,
             "output_commitment",
-            "json_sha256",
-            "commitment",
+            ProvenanceCommitMode::JsonSha256,
+            ProvenanceFieldDisclosure::Commitment,
             true,
             "object",
             "Hash and byte length of the upstream resolver output.",
@@ -610,8 +591,8 @@ fn resolver_template_fields() -> Vec<Value> {
         template_field(
             4,
             "source",
-            "json",
-            "public",
+            ProvenanceCommitMode::Json,
+            ProvenanceFieldDisclosure::Public,
             true,
             "string",
             "Fetched URL or search query.",
@@ -619,8 +600,8 @@ fn resolver_template_fields() -> Vec<Value> {
         template_field(
             5,
             "route",
-            "json",
-            "public",
+            ProvenanceCommitMode::Json,
+            ProvenanceFieldDisclosure::Public,
             true,
             "string",
             "Resolver HTTP or MCP route.",
@@ -628,8 +609,8 @@ fn resolver_template_fields() -> Vec<Value> {
         template_field(
             6,
             "mode",
-            "json",
-            "public",
+            ProvenanceCommitMode::Json,
+            ProvenanceFieldDisclosure::Public,
             true,
             "string",
             "Resolved execution mode.",
@@ -637,8 +618,8 @@ fn resolver_template_fields() -> Vec<Value> {
         template_field(
             7,
             "fetched_at_unix_ms",
-            "json",
-            "public",
+            ProvenanceCommitMode::Json,
+            ProvenanceFieldDisclosure::Public,
             true,
             "integer",
             "Fetch timestamp.",
@@ -646,8 +627,8 @@ fn resolver_template_fields() -> Vec<Value> {
         template_field(
             8,
             "receipt_id",
-            "json",
-            "public",
+            ProvenanceCommitMode::Json,
+            ProvenanceFieldDisclosure::Public,
             false,
             "string",
             "Resolver receipt id when created.",
@@ -655,8 +636,8 @@ fn resolver_template_fields() -> Vec<Value> {
         template_field(
             9,
             "program_id",
-            "json",
-            "public",
+            ProvenanceCommitMode::Json,
+            ProvenanceFieldDisclosure::Public,
             false,
             "string",
             "Optional deployment or program identifier.",
@@ -667,21 +648,21 @@ fn resolver_template_fields() -> Vec<Value> {
 fn template_field(
     index: u32,
     name: &str,
-    commit_mode: &str,
-    disclosure: &str,
+    commit_mode: ProvenanceCommitMode,
+    disclosure: ProvenanceFieldDisclosure,
     required: bool,
     value_type: &str,
     description: &str,
-) -> Value {
-    json!({
-        "index": index,
-        "name": name,
-        "commit_mode": commit_mode,
-        "disclosure": disclosure,
-        "required": required,
-        "value_type": value_type,
-        "description": description,
-    })
+) -> ProvenanceTemplateField {
+    ProvenanceTemplateField {
+        index,
+        name: name.to_string(),
+        commit_mode,
+        disclosure,
+        required,
+        value_type: Some(value_type.to_string()),
+        description: Some(description.to_string()),
+    }
 }
 
 fn primary_source(payload: &ProductRequest) -> String {
@@ -773,6 +754,16 @@ fn env_present(name: &str) -> bool {
         .unwrap_or(false)
 }
 
+fn backend_base_url_from_env() -> String {
+    configured_backend_base_url(optional_env("LIVY_BACKEND_BASE_URL"))
+}
+
+fn configured_backend_base_url(value: Option<String>) -> String {
+    value
+        .map(|value| trim_trailing_slash(&value))
+        .unwrap_or_else(|| DEFAULT_LIVY_API_BASE_URL.to_string())
+}
+
 fn env_bool(name: &str) -> Result<Option<bool>, ProvenanceError> {
     let Some(value) = optional_env(name) else {
         return Ok(None);
@@ -783,6 +774,18 @@ fn env_bool(name: &str) -> Result<Option<bool>, ProvenanceError> {
         _ => Err(ProvenanceError::InvalidEnv(format!(
             "{name} must be a boolean"
         ))),
+    }
+}
+
+fn parse_verification_mode(value: &str) -> Result<ProvenanceVerificationMode, ProvenanceError> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "binding_only" => Ok(ProvenanceVerificationMode::BindingOnly),
+        "verify" => Ok(ProvenanceVerificationMode::Verify),
+        "verify_fresh" => Ok(ProvenanceVerificationMode::VerifyFresh),
+        _ => Err(ProvenanceError::InvalidEnv(
+            "LIVY_PROVENANCE_VERIFICATION_MODE must be binding_only, verify, or verify_fresh"
+                .to_string(),
+        )),
     }
 }
 
@@ -820,11 +823,40 @@ mod tests {
     fn resolver_template_uses_generic_source_claim() {
         let fields = resolver_template_fields();
 
-        assert_eq!(fields[0]["name"], "application_domain");
-        assert_eq!(fields[2]["commit_mode"], "json_sha256");
-        assert_eq!(fields[3]["disclosure"], "commitment");
+        assert_eq!(fields[0].name, "application_domain");
+        assert_eq!(fields[2].commit_mode, ProvenanceCommitMode::JsonSha256);
+        assert_eq!(fields[3].disclosure, ProvenanceFieldDisclosure::Commitment);
         assert_eq!(ATTESTATION_CLAIM, "source");
         assert_eq!(SUBJECT_TYPE, "resolver_fetch");
         assert_eq!(DEFAULT_SCHEMA_ID, "resolver-fetch-v1");
+    }
+
+    #[test]
+    fn verification_mode_env_values_map_to_sdk_enum() {
+        assert_eq!(
+            parse_verification_mode("binding_only").unwrap(),
+            ProvenanceVerificationMode::BindingOnly
+        );
+        assert_eq!(
+            parse_verification_mode("verify").unwrap(),
+            ProvenanceVerificationMode::Verify
+        );
+        assert_eq!(
+            parse_verification_mode("verify_fresh").unwrap(),
+            ProvenanceVerificationMode::VerifyFresh
+        );
+        assert!(matches!(
+            parse_verification_mode("live"),
+            Err(ProvenanceError::InvalidEnv(_))
+        ));
+    }
+
+    #[test]
+    fn backend_base_url_defaults_to_livy_api_and_allows_override() {
+        assert_eq!(configured_backend_base_url(None), DEFAULT_LIVY_API_BASE_URL);
+        assert_eq!(
+            configured_backend_base_url(Some("http://localhost:8081///".to_string())),
+            "http://localhost:8081"
+        );
     }
 }
