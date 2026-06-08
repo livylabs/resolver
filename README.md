@@ -60,6 +60,8 @@ LIVY_EXPLORER_BASE_URL=https://api.livylabs.xyz
 LIVY_PROVENANCE_BOOTSTRAP_TEMPLATE=false
 ```
 
+`LIVY_BACKEND_BASE_URL` defaults to `https://api.livylabs.xyz`; set it for local or staging backends.
+
 Set `LIVY_PROVENANCE_BOOTSTRAP_TEMPLATE=true` only when the API key is
 allowed to write provenance templates. Public explorer reads also require
 the matching public template to exist in Livy.
@@ -117,5 +119,3 @@ curl -s http://localhost:3001/fetch \
   -H 'content-type: application/json' \
   -d '{"source":"https://example.com","mode":"fast","receipt":true}'
 ```
-
-
