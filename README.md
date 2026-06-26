@@ -123,9 +123,103 @@ Prefer `/fetch` with `mode` over the compat routes.
 
 - Endpoint: `/mcp`
 - Server: `livygensyn-source-fetcher`
-- Tool: `fetch_source` — input `{ "url": "..." }`
+- Tool: `fetch_source`
 
 Use when the prompt contains `source: <url>`, "only take this source", "source of truth", or an explicitly required URL. Pass the exact URL, don't search or substitute.
+
+### Tool Contract
+
+`fetch_source` fetches one caller-provided URL through the fast SmartMode proxy path and returns receipt metadata plus extracted source content. It is the only MCP tool exposed by this server.
+
+The standalone tool contract is also available at [`docs/mcp-tools.md`](docs/mcp-tools.md).
+
+Tool definition:
+
+```json
+{
+  "name": "fetch_source",
+  "description": "Fetch the exact source URL supplied by the user using the fast SmartMode proxy path. Use this whenever the prompt contains a source URL, `source: <url>`, `only take this source`, or says the URL is the source of truth. Do not perform web search or substitute another article.",
+  "annotations": {
+    "title": "Fetch exact source URL",
+    "readOnlyHint": true,
+    "destructiveHint": false,
+    "idempotentHint": true,
+    "openWorldHint": true
+  }
+}
+```
+
+Input schema:
+
+```json
+{
+  "type": "object",
+  "properties": {
+    "url": {
+      "type": "string",
+      "description": "The exact source URL from the user prompt. Do not replace it with a search query or another URL."
+    }
+  },
+  "required": ["url"],
+  "additionalProperties": false
+}
+```
+
+Call example:
+
+```json
+{
+  "url": "https://example.com/article"
+}
+```
+
+Output schema:
+
+```json
+{
+  "type": "object",
+  "properties": {
+    "content": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "type": { "const": "text" },
+          "text": {
+            "type": "string",
+            "description": "Plain text containing receipt_id, status, fetch_elapsed_ms, content_bytes, then the fetched source content after a --- separator."
+          }
+        },
+        "required": ["type", "text"]
+      }
+    },
+    "isError": { "type": "boolean" }
+  },
+  "required": ["content"]
+}
+```
+
+Successful text content format:
+
+```text
+receipt_id: <receipt id>
+status: <http status or unknown>
+fetch_elapsed_ms: <elapsed milliseconds or unknown>
+content_bytes: <byte count or unknown>
+
+---
+
+<extracted page content, or raw JSON payload if no content field exists>
+```
+
+Annotation rationale:
+
+| Annotation | Value | Reason |
+|---|---:|---|
+| `readOnlyHint` | `true` | The tool fetches source data and does not mutate customer/application state. |
+| `destructiveHint` | `false` | It does not delete, overwrite, send messages, charge money, or perform destructive updates. |
+| `idempotentHint` | `true` | Repeating the same fetch has no additional external side effect beyond another read/proxy request. |
+| `openWorldHint` | `true` | It can access arbitrary caller-provided URLs through an external proxy/fetch service. |
 
 ## Verify
 
