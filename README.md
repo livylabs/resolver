@@ -121,7 +121,7 @@ Prefer `/fetch` with `mode` over the compat routes.
 - Tool: `fetch_source` — input `{ "url": "..." }`
 - Auth: `tools/call` requires `Authorization: Bearer <livy_oauth_access_token>` with `tool:fetch_source` or `mcp` scope and the resolver audience
 - Discovery: unauthenticated `tools/list` is allowed so clients can read the tool descriptor; unauthenticated `fetch_source` calls return `_meta["mcp/www_authenticate"]` with the protected-resource metadata URL, required scope, `error="invalid_request"`, and an error description
-- ChatGPT metadata: the `fetch_source` tool descriptor includes top-level `securitySchemes` and `_meta.securitySchemes` for OAuth scope `tool:fetch_source` plus read-only/open-world annotations
+- ChatGPT metadata: the `fetch_source` tool descriptor includes top-level `title` and `securitySchemes`, `_meta.securitySchemes`, short invocation status text, and read-only/open-world annotations
 
 Use when the prompt contains `source: <url>`, "only take this source", "source of truth", or an explicitly required URL. Pass the exact URL, don't search or substitute.
 

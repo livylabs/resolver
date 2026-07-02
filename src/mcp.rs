@@ -20,6 +20,9 @@ use serde_json::{Value, json};
 use std::{fmt::Write, sync::Arc, time::Instant};
 
 const FETCH_SOURCE_SCOPES: &[&str] = &["tool:fetch_source"];
+const FETCH_SOURCE_TITLE: &str = "Fetch Source";
+const FETCH_SOURCE_INVOCATION_START: &str = "Fetching source";
+const FETCH_SOURCE_INVOCATION_DONE: &str = "Source fetched";
 const MCP_COMPAT_BODY_LIMIT: usize = 1024 * 1024;
 
 #[derive(serde::Deserialize, schemars::JsonSchema)]
@@ -147,7 +150,7 @@ async fn mirror_tools_list_response_security_schemes(response: Response) -> Resp
     let Ok(body_text) = std::str::from_utf8(&body_bytes) else {
         return Response::from_parts(parts, Body::from(body_bytes));
     };
-    let (rewritten, changed) = mirror_security_schemes_in_sse(body_text);
+    let (rewritten, changed) = enrich_tools_list_response_for_chatgpt(body_text);
     if !changed {
         return Response::from_parts(parts, Body::from(body_bytes));
     }
@@ -156,7 +159,7 @@ async fn mirror_tools_list_response_security_schemes(response: Response) -> Resp
     Response::from_parts(parts, Body::from(rewritten))
 }
 
-fn mirror_security_schemes_in_sse(body: &str) -> (String, bool) {
+fn enrich_tools_list_response_for_chatgpt(body: &str) -> (String, bool) {
     let mut changed = false;
     let mut rewritten = String::with_capacity(body.len());
 
@@ -172,7 +175,7 @@ fn mirror_security_schemes_in_sse(body: &str) -> (String, bool) {
             continue;
         };
 
-        if mirror_security_schemes_in_message(&mut value) {
+        if enrich_tools_list_message_for_chatgpt(&mut value) {
             changed = true;
             rewritten.push_str("data: ");
             rewritten.push_str(&value.to_string());
@@ -185,7 +188,7 @@ fn mirror_security_schemes_in_sse(body: &str) -> (String, bool) {
     (rewritten, changed)
 }
 
-fn mirror_security_schemes_in_message(message: &mut Value) -> bool {
+fn enrich_tools_list_message_for_chatgpt(message: &mut Value) -> bool {
     let Some(tools) = message
         .get_mut("result")
         .and_then(|result| result.get_mut("tools"))
@@ -199,9 +202,44 @@ fn mirror_security_schemes_in_message(message: &mut Value) -> bool {
         let Some(tool_object) = tool.as_object_mut() else {
             continue;
         };
+        if tool_object.get("name").and_then(Value::as_str) == Some("fetch_source") {
+            if !tool_object.contains_key("title") {
+                tool_object.insert("title".to_string(), json!(FETCH_SOURCE_TITLE));
+                changed = true;
+            }
+
+            let meta = tool_object
+                .entry("_meta".to_string())
+                .or_insert_with(|| json!({}));
+            if let Some(meta_object) = meta.as_object_mut() {
+                if !meta_object.contains_key("securitySchemes") {
+                    meta_object.insert(
+                        "securitySchemes".to_string(),
+                        fetch_source_security_schemes(),
+                    );
+                    changed = true;
+                }
+                if !meta_object.contains_key("openai/toolInvocation/invoking") {
+                    meta_object.insert(
+                        "openai/toolInvocation/invoking".to_string(),
+                        json!(FETCH_SOURCE_INVOCATION_START),
+                    );
+                    changed = true;
+                }
+                if !meta_object.contains_key("openai/toolInvocation/invoked") {
+                    meta_object.insert(
+                        "openai/toolInvocation/invoked".to_string(),
+                        json!(FETCH_SOURCE_INVOCATION_DONE),
+                    );
+                    changed = true;
+                }
+            }
+        }
+
         if tool_object.contains_key("securitySchemes") {
             continue;
         }
+
         let Some(schemes) = tool_object
             .get("_meta")
             .and_then(|meta| meta.get("securitySchemes"))
@@ -264,14 +302,26 @@ fn fetch_source_tool_meta() -> Meta {
     let mut meta = Meta::new();
     meta.insert(
         "securitySchemes".to_string(),
-        json!([
-            {
-                "type": "oauth2",
-                "scopes": ["tool:fetch_source"]
-            }
-        ]),
+        fetch_source_security_schemes(),
+    );
+    meta.insert(
+        "openai/toolInvocation/invoking".to_string(),
+        json!(FETCH_SOURCE_INVOCATION_START),
+    );
+    meta.insert(
+        "openai/toolInvocation/invoked".to_string(),
+        json!(FETCH_SOURCE_INVOCATION_DONE),
     );
     meta
+}
+
+fn fetch_source_security_schemes() -> Value {
+    json!([
+        {
+            "type": "oauth2",
+            "scopes": ["tool:fetch_source"]
+        }
+    ])
 }
 
 fn render_fetch_result(data: &FetchWithReceipt) -> String {
@@ -342,6 +392,18 @@ mod tests {
         assert_eq!(schemes[0]["type"], "oauth2");
         assert_eq!(schemes[0]["scopes"][0], "tool:fetch_source");
         assert_eq!(
+            tool.meta
+                .as_ref()
+                .and_then(|meta| meta.get("openai/toolInvocation/invoking")),
+            Some(&json!("Fetching source"))
+        );
+        assert_eq!(
+            tool.meta
+                .as_ref()
+                .and_then(|meta| meta.get("openai/toolInvocation/invoked")),
+            Some(&json!("Source fetched"))
+        );
+        assert_eq!(
             tool.annotations
                 .as_ref()
                 .and_then(|annotations| annotations.read_only_hint),
@@ -389,7 +451,7 @@ mod tests {
     }
 
     #[test]
-    fn mirrors_meta_security_schemes_to_top_level() {
+    fn enriches_fetch_source_descriptor_for_chatgpt() {
         let mut message = json!({
             "jsonrpc": "2.0",
             "id": 2,
@@ -406,10 +468,19 @@ mod tests {
             }
         });
 
-        assert!(super::mirror_security_schemes_in_message(&mut message));
+        assert!(super::enrich_tools_list_message_for_chatgpt(&mut message));
+        assert_eq!(message["result"]["tools"][0]["title"], "Fetch Source");
         assert_eq!(
             message["result"]["tools"][0]["securitySchemes"],
             message["result"]["tools"][0]["_meta"]["securitySchemes"]
+        );
+        assert_eq!(
+            message["result"]["tools"][0]["_meta"]["openai/toolInvocation/invoking"],
+            "Fetching source"
+        );
+        assert_eq!(
+            message["result"]["tools"][0]["_meta"]["openai/toolInvocation/invoked"],
+            "Source fetched"
         );
     }
 }
