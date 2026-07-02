@@ -9,7 +9,7 @@ Default mode is SmartMode. Override via `mode` when you need specific cost/speed
 - [x] Proxy enabling for complex requests
 - [ ] Residential proxy rotations
 - [ ] Prompt-based interaction with results
-- [ ] MCP auth
+- [x] MCP auth
 - [ ] Obscura headless (research)
 
 ## Setup
@@ -126,6 +126,33 @@ Prefer `/fetch` with `mode` over the compat routes.
 - Tool: `fetch_source` — input `{ "url": "..." }`
 
 Use when the prompt contains `source: <url>`, "only take this source", "source of truth", or an explicitly required URL. Pass the exact URL, don't search or substitute.
+
+### MCP Livy Login
+
+Set these variables to require Livy OAuth login before `/mcp` can be used:
+
+```dotenv
+LIVY_OAUTH_ENABLED=true
+LIVY_OAUTH_CLIENT_ID=...
+LIVY_OAUTH_CLIENT_SECRET=...
+LIVY_OAUTH_AUTH_URL=https://...
+LIVY_OAUTH_TOKEN_URL=https://...
+LIVY_OAUTH_REDIRECT_URL=http://localhost:3001/auth/livy/callback
+```
+
+Optional:
+
+```dotenv
+LIVY_OAUTH_INTROSPECTION_URL=https://...
+LIVY_OAUTH_SCOPES=openid profile email
+LIVY_OAUTH_COOKIE_NAME=livy_resolver_session
+LIVY_OAUTH_SESSION_TTL_SECS=28800
+LIVY_OAUTH_STATE_TTL_SECS=600
+LIVY_OAUTH_INTROSPECTION_CACHE_SECS=60
+LIVY_OAUTH_COOKIE_SECURE=false
+```
+
+Open `/auth/livy/login` to start login. The resolver redirects to Livy; if the browser already has a Livy session, Livy uses its own cookies and sends the user back without prompting. The resolver then sets its own local MCP session cookie. Non-MCP HTTP routes remain public.
 
 ## Verify
 

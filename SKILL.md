@@ -15,6 +15,7 @@ sources through Spider-backed Livy access. It exposes:
 
 - an MCP endpoint at `http://localhost:3001/mcp`
 - one MCP tool, `fetch_source`, for exact source-of-truth URL fetching
+- optional Livy OAuth login in front of `/mcp`
 - HTTP routes for product-style fetch, crawl, map, search, extract,
   screenshot, unblock, and receipt flows
 
@@ -98,6 +99,29 @@ public template to exist in Livy.
 
 ## MCP Use
 
+If Livy OAuth is enabled, users must visit:
+
+```text
+http://localhost:3001/auth/livy/login
+```
+
+The resolver redirects to Livy login. If the browser already has a Livy
+session, Livy uses its own cookies and returns immediately. The resolver
+then stores a local session cookie for `/mcp`. MCP clients can also send a
+Livy access token as `Authorization: Bearer ...` when
+`LIVY_OAUTH_INTROSPECTION_URL` is configured.
+
+Required OAuth variables:
+
+```dotenv
+LIVY_OAUTH_ENABLED=true
+LIVY_OAUTH_CLIENT_ID=...
+LIVY_OAUTH_CLIENT_SECRET=...
+LIVY_OAUTH_AUTH_URL=...
+LIVY_OAUTH_TOKEN_URL=...
+LIVY_OAUTH_REDIRECT_URL=http://localhost:3001/auth/livy/callback
+```
+
 Use `fetch_source` when the user gives an exact URL as the required
 source:
 
@@ -153,6 +177,7 @@ curl -s http://localhost:3001/fetch \
 ## Code Map
 
 - `src/main.rs`: mounts HTTP routes and `/mcp`
+- `src/auth.rs`: handles Livy OAuth login and `/mcp` auth
 - `src/mcp.rs`: defines `fetch_source`
 - `src/fetch.rs`: reads `SPIDER_API_KEY`, calls Spider, stores receipts
 - `src/provenance.rs`: builds and posts generic resolver source-fetch

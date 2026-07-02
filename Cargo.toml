@@ -14,7 +14,9 @@ dotenvy = "0.15.7"
 hex = "0.4.3"
 livy-tee = { version = "0.1.1" , features = ["ita-verify"]}
 livy-provenance-sdk = { path = "../rwa/packages/provenance-sdk" }
-reqwest = "0.12.28"
+oauth2 = { version = "5", features = ["reqwest"] }
+rand = "0.9.2"
+reqwest = { version = "0.12.28", features = ["json"] }
 rmcp = {version ="1.7.0", features = ["server", "transport-streamable-http-server"]}
 serde = {version = "1.0.228" , features = ["derive"]}
 serde_json = "1.0.149"
@@ -22,3 +24,4 @@ sha2 = "0.10.9"
 spider-client = "0.1.87"
 thiserror = "2.0.18"
 tokio = {version = "1.52.1" , features= ["macros", "net", "rt-multi-thread"]}
+tower = "0.5.2"

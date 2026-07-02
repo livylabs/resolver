@@ -1,6 +1,7 @@
 //! Axum entrypoint that mounts HTTP product routes and MCP transport.
 
 mod api;
+mod auth;
 mod errors;
 mod fetch;
 mod mcp;
@@ -16,6 +17,7 @@ use axum::{
     routing::{get, post},
 };
 use std::sync::Arc;
+use tower::ServiceBuilder;
 
 use crate::errors::{FetchError, Result};
 use rmcp::transport::streamable_http_server::{
@@ -26,6 +28,7 @@ use rmcp::transport::streamable_http_server::{
 async fn main() -> Result<()> {
     let fetcher = Arc::new(fetch::Fetcher::new());
     let mcp_fetcher = fetcher.clone();
+    let oauth = auth::AuthState::from_env()?;
 
     let mcp_service = StreamableHttpService::new(
         move || Ok(mcp::Server::new(mcp_fetcher.clone())),
@@ -33,7 +36,7 @@ async fn main() -> Result<()> {
         mcp_config(),
     );
 
-    let app = Router::new()
+    let mut app = Router::new()
         .route("/fetch", post(fetch_post))
         .route("/crawl", post(crawl_post))
         .route("/map", post(map_post))
@@ -46,8 +49,17 @@ async fn main() -> Result<()> {
         .route("/receipt/{id}", get(get_receipt))
         .route("/recipt/{id}", get(get_receipt))
         .route("/healthz", get(|| async { "ok" }))
-        .nest_service("/mcp", mcp_service)
         .with_state(fetcher);
+
+    app = if let Some(oauth) = oauth {
+        let mcp_service = ServiceBuilder::new()
+            .layer(auth::AuthLayer::new(oauth.clone()))
+            .service(mcp_service);
+        app.merge(auth::router(oauth))
+            .nest_service("/mcp", mcp_service)
+    } else {
+        app.nest_service("/mcp", mcp_service)
+    };
 
     let port = std::env::var("PORT")
         .or_else(|_| std::env::var("RESOLVER_PORT"))
