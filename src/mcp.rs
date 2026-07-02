@@ -87,7 +87,9 @@ impl Server {
             started.elapsed().as_millis(),
             text.len()
         );
-        Ok(CallToolResult::success(vec![Content::text(text)]))
+        let mut result = CallToolResult::structured(structured_fetch_result(&data));
+        result.content = vec![Content::text(text)];
+        Ok(result)
     }
 }
 
@@ -210,6 +212,10 @@ fn enrich_tools_list_message_for_chatgpt(message: &mut Value) -> bool {
         if tool_object.get("name").and_then(Value::as_str) == Some("fetch_source") {
             if !tool_object.contains_key("title") {
                 tool_object.insert("title".to_string(), json!(FETCH_SOURCE_TITLE));
+                changed = true;
+            }
+            if !tool_object.contains_key("outputSchema") {
+                tool_object.insert("outputSchema".to_string(), fetch_source_output_schema());
                 changed = true;
             }
 
@@ -371,8 +377,70 @@ fn fetch_source_security_schemes() -> Value {
     ])
 }
 
+fn fetch_source_output_schema() -> Value {
+    json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+            "receipt_id": {
+                "type": "string",
+                "description": "Livy resolver receipt id for this fetch."
+            },
+            "source_url": {
+                "type": "string",
+                "description": "The exact URL that was fetched."
+            },
+            "status": {
+                "type": "integer",
+                "description": "Upstream HTTP status code when available."
+            },
+            "fetch_elapsed_ms": {
+                "type": "integer",
+                "description": "Elapsed upstream fetch time in milliseconds when available."
+            },
+            "content_bytes": {
+                "type": "integer",
+                "description": "Extracted content size in bytes when available."
+            },
+            "text": {
+                "type": "string",
+                "description": "Fetched source text or serialized upstream payload."
+            }
+        },
+        "required": ["receipt_id", "source_url", "text"],
+        "additionalProperties": false
+    })
+}
+
 fn chatgpt_tool_visibility() -> Value {
     json!(["model", "app"])
+}
+
+fn structured_fetch_result(data: &FetchWithReceipt) -> Value {
+    let mut result = serde_json::Map::new();
+    let receipt = &data.receipt;
+
+    result.insert("receipt_id".to_string(), json!(data.receipt_id));
+    result.insert("source_url".to_string(), json!(receipt.source_url));
+    if let Some(status) = receipt.status {
+        result.insert("status".to_string(), json!(status));
+    }
+    if let Some(elapsed) = receipt.duration_elapsed_ms {
+        result.insert("fetch_elapsed_ms".to_string(), json!(elapsed));
+    }
+    if let Some(content_bytes) = receipt.content_bytes {
+        result.insert("content_bytes".to_string(), json!(content_bytes));
+    }
+    result.insert(
+        "text".to_string(),
+        json!(
+            extracted_content(&data.data)
+                .map(str::to_string)
+                .unwrap_or_else(|| data.data.to_string())
+        ),
+    );
+
+    Value::Object(result)
 }
 
 fn render_fetch_result(data: &FetchWithReceipt) -> String {
@@ -543,6 +611,10 @@ mod tests {
 
         assert!(super::enrich_tools_list_message_for_chatgpt(&mut message));
         assert_eq!(message["result"]["tools"][0]["title"], "Fetch Source");
+        assert_eq!(
+            message["result"]["tools"][0]["outputSchema"]["required"],
+            json!(["receipt_id", "source_url", "text"])
+        );
         assert_eq!(
             message["result"]["tools"][0]["annotations"]["destructiveHint"],
             false
