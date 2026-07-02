@@ -49,7 +49,12 @@ impl Server {
     #[tool(
         name = "fetch_source",
         description = "Fetch the exact source URL supplied by the user using the fast SmartMode proxy path. Use this whenever the prompt contains a source URL, `source: <url>`, `only take this source`, or says the URL is the source of truth. Do not perform web search or substitute another article.",
-        annotations(title = "Fetch Source", read_only_hint = true, open_world_hint = true),
+        annotations(
+            title = "Fetch Source",
+            read_only_hint = true,
+            destructive_hint = false,
+            open_world_hint = true
+        ),
         meta = "fetch_source_tool_meta()"
     )]
     async fn fetch_source(
@@ -212,6 +217,15 @@ fn enrich_tools_list_message_for_chatgpt(message: &mut Value) -> bool {
                 .entry("_meta".to_string())
                 .or_insert_with(|| json!({}));
             if let Some(meta_object) = meta.as_object_mut() {
+                let ui = meta_object
+                    .entry("ui".to_string())
+                    .or_insert_with(|| json!({}));
+                if let Some(ui_object) = ui.as_object_mut() {
+                    if !ui_object.contains_key("visibility") {
+                        ui_object.insert("visibility".to_string(), chatgpt_tool_visibility());
+                        changed = true;
+                    }
+                }
                 if !meta_object.contains_key("securitySchemes") {
                     meta_object.insert(
                         "securitySchemes".to_string(),
@@ -231,6 +245,32 @@ fn enrich_tools_list_message_for_chatgpt(message: &mut Value) -> bool {
                         "openai/toolInvocation/invoked".to_string(),
                         json!(FETCH_SOURCE_INVOCATION_DONE),
                     );
+                    changed = true;
+                }
+                if !meta_object.contains_key("openai/visibility") {
+                    meta_object.insert("openai/visibility".to_string(), json!("public"));
+                    changed = true;
+                }
+            }
+
+            let annotations = tool_object
+                .entry("annotations".to_string())
+                .or_insert_with(|| json!({}));
+            if let Some(annotation_object) = annotations.as_object_mut() {
+                if !annotation_object.contains_key("title") {
+                    annotation_object.insert("title".to_string(), json!(FETCH_SOURCE_TITLE));
+                    changed = true;
+                }
+                if !annotation_object.contains_key("readOnlyHint") {
+                    annotation_object.insert("readOnlyHint".to_string(), json!(true));
+                    changed = true;
+                }
+                if !annotation_object.contains_key("destructiveHint") {
+                    annotation_object.insert("destructiveHint".to_string(), json!(false));
+                    changed = true;
+                }
+                if !annotation_object.contains_key("openWorldHint") {
+                    annotation_object.insert("openWorldHint".to_string(), json!(true));
                     changed = true;
                 }
             }
@@ -305,6 +345,13 @@ fn fetch_source_tool_meta() -> Meta {
         fetch_source_security_schemes(),
     );
     meta.insert(
+        "ui".to_string(),
+        json!({
+            "visibility": chatgpt_tool_visibility()
+        }),
+    );
+    meta.insert("openai/visibility".to_string(), json!("public"));
+    meta.insert(
         "openai/toolInvocation/invoking".to_string(),
         json!(FETCH_SOURCE_INVOCATION_START),
     );
@@ -322,6 +369,10 @@ fn fetch_source_security_schemes() -> Value {
             "scopes": ["tool:fetch_source"]
         }
     ])
+}
+
+fn chatgpt_tool_visibility() -> Value {
+    json!(["model", "app"])
 }
 
 fn render_fetch_result(data: &FetchWithReceipt) -> String {
@@ -398,6 +449,16 @@ mod tests {
             Some(&json!("Fetching source"))
         );
         assert_eq!(
+            tool.meta.as_ref().and_then(|meta| meta.get("ui")),
+            Some(&json!({ "visibility": ["model", "app"] }))
+        );
+        assert_eq!(
+            tool.meta
+                .as_ref()
+                .and_then(|meta| meta.get("openai/visibility")),
+            Some(&json!("public"))
+        );
+        assert_eq!(
             tool.meta
                 .as_ref()
                 .and_then(|meta| meta.get("openai/toolInvocation/invoked")),
@@ -407,6 +468,18 @@ mod tests {
             tool.annotations
                 .as_ref()
                 .and_then(|annotations| annotations.read_only_hint),
+            Some(true)
+        );
+        assert_eq!(
+            tool.annotations
+                .as_ref()
+                .and_then(|annotations| annotations.destructive_hint),
+            Some(false)
+        );
+        assert_eq!(
+            tool.annotations
+                .as_ref()
+                .and_then(|annotations| annotations.open_world_hint),
             Some(true)
         );
     }
@@ -471,12 +544,24 @@ mod tests {
         assert!(super::enrich_tools_list_message_for_chatgpt(&mut message));
         assert_eq!(message["result"]["tools"][0]["title"], "Fetch Source");
         assert_eq!(
+            message["result"]["tools"][0]["annotations"]["destructiveHint"],
+            false
+        );
+        assert_eq!(
             message["result"]["tools"][0]["securitySchemes"],
             message["result"]["tools"][0]["_meta"]["securitySchemes"]
         );
         assert_eq!(
             message["result"]["tools"][0]["_meta"]["openai/toolInvocation/invoking"],
             "Fetching source"
+        );
+        assert_eq!(
+            message["result"]["tools"][0]["_meta"]["ui"]["visibility"],
+            json!(["model", "app"])
+        );
+        assert_eq!(
+            message["result"]["tools"][0]["_meta"]["openai/visibility"],
+            "public"
         );
         assert_eq!(
             message["result"]["tools"][0]["_meta"]["openai/toolInvocation/invoked"],
