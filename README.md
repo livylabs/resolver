@@ -9,7 +9,7 @@ Default mode is SmartMode. Override via `mode` when you need specific cost/speed
 - [x] Proxy enabling for complex requests
 - [ ] Residential proxy rotations
 - [ ] Prompt-based interaction with results
-- [ ] MCP auth
+- [x] MCP auth
 - [ ] Obscura headless (research)
 
 ## Setup
@@ -22,6 +22,17 @@ cargo run
 `LIVY_KEY` is still accepted as a legacy alias for `SPIDER_API_KEY`.
 The service listens on `http://localhost:3001` unless `PORT` or
 `RESOLVER_PORT` is set.
+
+Product routes and MCP `tools/call` require a Livy OAuth bearer token by default.
+MCP `tools/list` remains public for connector discovery. Local-only
+unauthenticated development can set `LIVY_RESOLVER_AUTH_ENABLED=false`.
+
+```dotenv
+LIVY_OAUTH_ISSUER=https://auth.livylabs.xyz
+LIVY_OAUTH_INTROSPECTION_URL=https://auth.livylabs.xyz/oauth/introspect
+LIVY_RESOLVER_OAUTH_AUDIENCE=https://resolver.api.livylabs.xyz
+LIVY_RESOLVER_OAUTH_RESOURCE_METADATA_URL=https://resolver.api.livylabs.xyz/.well-known/oauth-protected-resource
+```
 
 ## Livy Provenance
 
@@ -132,8 +143,12 @@ Prefer `/fetch` with `mode` over the compat routes.
 ## MCP
 
 - Endpoint: `/mcp`
+- Protected resource metadata: `/.well-known/oauth-protected-resource` and `/.well-known/oauth-protected-resource/mcp`, including `resource_name` and the Livy OAuth introspection endpoint
 - Server: `livygensyn-source-fetcher`
 - Tool: `fetch_source` — input `{ "url": "..." }`
+- Auth: `tools/call` requires `Authorization: Bearer <livy_oauth_access_token>` with `tool:fetch_source` or `mcp` scope and the resolver audience
+- Discovery: unauthenticated `tools/list` is allowed so clients can read the tool descriptor; unauthenticated `fetch_source` calls return `_meta["mcp/www_authenticate"]` with the protected-resource metadata URL, required scope, `error="invalid_request"`, and an error description
+- ChatGPT metadata: the `fetch_source` tool descriptor includes top-level `title` and `securitySchemes`, `_meta.securitySchemes`, short invocation status text, and read-only/open-world annotations
 
 Use when the prompt contains `source: <url>`, "only take this source", "source of truth", or an explicitly required URL. Pass the exact URL, don't search or substitute.
 
@@ -142,5 +157,6 @@ Use when the prompt contains `source: <url>`, "only take this source", "source o
 ```bash
 curl -s http://localhost:3001/fetch \
   -H 'content-type: application/json' \
+  -H "authorization: Bearer $LIVY_OAUTH_ACCESS_TOKEN" \
   -d '{"source":"https://example.com","mode":"fast","receipt":true}'
 ```

@@ -521,9 +521,37 @@ mod tests {
             Some(&json!("Fetching source"))
         );
         assert_eq!(
+            tool.meta.as_ref().and_then(|meta| meta.get("ui")),
+            Some(&json!({ "visibility": ["model", "app"] }))
+        );
+        assert_eq!(
+            tool.meta
+                .as_ref()
+                .and_then(|meta| meta.get("openai/visibility")),
+            Some(&json!("public"))
+        );
+        assert_eq!(
+            tool.meta
+                .as_ref()
+                .and_then(|meta| meta.get("openai/toolInvocation/invoked")),
+            Some(&json!("Source fetched"))
+        );
+        assert_eq!(
             tool.annotations
                 .as_ref()
                 .and_then(|annotations| annotations.read_only_hint),
+            Some(true)
+        );
+        assert_eq!(
+            tool.annotations
+                .as_ref()
+                .and_then(|annotations| annotations.destructive_hint),
+            Some(false)
+        );
+        assert_eq!(
+            tool.annotations
+                .as_ref()
+                .and_then(|annotations| annotations.open_world_hint),
             Some(true)
         );
     }
@@ -555,6 +583,19 @@ mod tests {
     }
 
     #[test]
+    fn detects_tools_list_requests() {
+        assert!(super::is_tools_list_request(
+            br#"{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}"#
+        ));
+        assert!(super::is_tools_list_request(
+            br#"[{"jsonrpc":"2.0","id":1,"method":"initialize"},{"jsonrpc":"2.0","id":2,"method":"tools/list"}]"#
+        ));
+        assert!(!super::is_tools_list_request(
+            br#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{}}"#
+        ));
+    }
+
+    #[test]
     fn enriches_fetch_source_descriptor_for_chatgpt() {
         let mut message = json!({
             "jsonrpc": "2.0",
@@ -575,12 +616,32 @@ mod tests {
         assert!(super::enrich_tools_list_message_for_chatgpt(&mut message));
         assert_eq!(message["result"]["tools"][0]["title"], "Fetch Source");
         assert_eq!(
-            message["result"]["tools"][0]["securitySchemes"][0]["scopes"][0],
-            "tool:fetch_source"
+            message["result"]["tools"][0]["outputSchema"]["required"],
+            json!(["receipt_id", "source_url", "text"])
         );
         assert_eq!(
-            message["result"]["tools"][0]["annotations"]["readOnlyHint"],
-            true
+            message["result"]["tools"][0]["annotations"]["destructiveHint"],
+            false
+        );
+        assert_eq!(
+            message["result"]["tools"][0]["securitySchemes"],
+            message["result"]["tools"][0]["_meta"]["securitySchemes"]
+        );
+        assert_eq!(
+            message["result"]["tools"][0]["_meta"]["openai/toolInvocation/invoking"],
+            "Fetching source"
+        );
+        assert_eq!(
+            message["result"]["tools"][0]["_meta"]["ui"]["visibility"],
+            json!(["model", "app"])
+        );
+        assert_eq!(
+            message["result"]["tools"][0]["_meta"]["openai/visibility"],
+            "public"
+        );
+        assert_eq!(
+            message["result"]["tools"][0]["_meta"]["openai/toolInvocation/invoked"],
+            "Source fetched"
         );
     }
 }
