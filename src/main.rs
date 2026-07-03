@@ -1,6 +1,7 @@
 //! Axum entrypoint that mounts HTTP product routes and MCP transport.
 
 mod api;
+mod auth;
 mod errors;
 mod fetch;
 mod mcp;
@@ -12,7 +13,7 @@ use api::{
     screenshot_post, search_post, snapshot_source,
 };
 use axum::{
-    Router,
+    Router, middleware,
     routing::{get, post},
 };
 use std::sync::Arc;
@@ -26,14 +27,18 @@ use rmcp::transport::streamable_http_server::{
 async fn main() -> Result<()> {
     let fetcher = Arc::new(fetch::Fetcher::new());
     let mcp_fetcher = fetcher.clone();
+    let resolver_auth = Arc::new(auth::ResolverAuth::from_env());
+    let mcp_auth = resolver_auth.clone();
+    let metadata_auth = resolver_auth.clone();
+    let mcp_metadata_auth = resolver_auth.clone();
 
     let mcp_service = StreamableHttpService::new(
-        move || Ok(mcp::Server::new(mcp_fetcher.clone())),
+        move || Ok(mcp::Server::new(mcp_fetcher.clone(), mcp_auth.clone())),
         LocalSessionManager::default().into(),
         mcp_config(),
     );
 
-    let app = Router::new()
+    let product_routes = Router::new()
         .route("/fetch", post(fetch_post))
         .route("/crawl", post(crawl_post))
         .route("/map", post(map_post))
@@ -45,8 +50,33 @@ async fn main() -> Result<()> {
         .route("/fetchunblock", post(fetch_unblock))
         .route("/receipt/{id}", get(get_receipt))
         .route("/recipt/{id}", get(get_receipt))
-        .route("/healthz", get(|| async { "ok" }))
+        .route_layer(middleware::from_fn_with_state(
+            resolver_auth.clone(),
+            auth::require_product_oauth,
+        ));
+
+    let mcp_routes = Router::new()
         .nest_service("/mcp", mcp_service)
+        .route_layer(middleware::from_fn(mcp::mirror_tools_list_security_schemes));
+
+    let app = Router::new()
+        .route("/healthz", get(|| async { "ok" }))
+        .route(
+            "/.well-known/oauth-protected-resource",
+            get(move || {
+                let auth = metadata_auth.clone();
+                async move { auth::oauth_protected_resource_metadata(auth).await }
+            }),
+        )
+        .route(
+            "/.well-known/oauth-protected-resource/mcp",
+            get(move || {
+                let auth = mcp_metadata_auth.clone();
+                async move { auth::oauth_protected_resource_metadata(auth).await }
+            }),
+        )
+        .merge(product_routes)
+        .merge(mcp_routes)
         .with_state(fetcher);
 
     let port = std::env::var("PORT")

@@ -1,17 +1,22 @@
 //! Livy provenance client for resolver fetch attestations.
 
+use crate::auth::ResolverAuthContext;
 use crate::types::{
     FormatSelection, ProductFormat, ProductMode, ProductProxy, ProductRequest, ProductRoute,
     Receipt,
 };
 use livy_provenance_sdk::{
     CreateProvenanceAttestationRequest, DEFAULT_LIVY_API_BASE_URL, ProvenanceAttestationField,
-    ProvenanceClient as LivyProvenanceApiClient, ProvenanceClientConfig, ProvenanceClientError,
-    ProvenanceCommitMode, ProvenanceFieldDisclosure, ProvenanceManagedPublicationRequest,
-    ProvenanceRegistryRefResponse, ProvenanceTemplateField, ProvenanceVerificationMode,
-    RegistryRefWaitOptions, UpsertProvenanceTemplateRequest,
+    ProvenanceAttestationResponse, ProvenanceClient as LivyProvenanceApiClient,
+    ProvenanceClientConfig, ProvenanceClientError, ProvenanceCommitMode, ProvenanceFieldDisclosure,
+    ProvenanceManagedPublicationRequest, ProvenanceRegistryRefResponse, ProvenanceTemplateField,
+    ProvenanceVerificationMode, RegistryRefWaitOptions, UpsertProvenanceTemplateRequest,
 };
 use livy_tee::Livy;
+use reqwest::{
+    StatusCode,
+    header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue},
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -31,7 +36,8 @@ const ATTESTATION_CLAIM: &str = "source";
 #[derive(Debug)]
 pub struct ProvenanceClient {
     config: ProvenanceConfig,
-    api: LivyProvenanceApiClient,
+    api: Option<LivyProvenanceApiClient>,
+    http: reqwest::Client,
     livy: Livy,
     template_ready: AtomicBool,
 }
@@ -40,6 +46,7 @@ pub struct ProvenanceClient {
 struct ProvenanceConfig {
     backend_base_url: String,
     explorer_base_url: Option<String>,
+    integration_id: String,
     schema_id: String,
     schema_version: String,
     visibility: String,
@@ -51,6 +58,7 @@ struct ProvenanceConfig {
     wait_for_registry_refs: bool,
     registry_wait_attempts: u32,
     registry_wait_interval_ms: u64,
+    legacy_service_api_key_allowed: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -128,6 +136,8 @@ pub enum ProvenanceError {
     MissingEnv(&'static str),
     InvalidEnv(String),
     Sdk(ProvenanceClientError),
+    Http(reqwest::Error),
+    Backend { status: StatusCode, body: String },
     Json(serde_json::Error),
     Attestation(String),
     Time(String),
@@ -139,6 +149,10 @@ impl fmt::Display for ProvenanceError {
             Self::MissingEnv(name) => write!(f, "{name} must be set when provenance is enabled"),
             Self::InvalidEnv(message) => write!(f, "invalid provenance configuration: {message}"),
             Self::Sdk(err) => write!(f, "provenance SDK failed: {err}"),
+            Self::Http(err) => write!(f, "provenance HTTP request failed: {err}"),
+            Self::Backend { status, body } => {
+                write!(f, "provenance backend returned {status}: {body}")
+            }
             Self::Json(err) => write!(f, "provenance JSON handling failed: {err}"),
             Self::Attestation(err) => write!(f, "provenance attestation failed: {err}"),
             Self::Time(err) => write!(f, "provenance timestamp failed: {err}"),
@@ -157,6 +171,12 @@ impl From<ProvenanceClientError> for ProvenanceError {
 impl From<serde_json::Error> for ProvenanceError {
     fn from(err: serde_json::Error) -> Self {
         Self::Json(err)
+    }
+}
+
+impl From<reqwest::Error> for ProvenanceError {
+    fn from(err: reqwest::Error) -> Self {
+        Self::Http(err)
     }
 }
 
@@ -181,7 +201,7 @@ impl ProvenanceClient {
         }
 
         let backend_base_url = backend_base_url_from_env();
-        let api_key = required_env("LIVY_API_KEY")?;
+        let api_key = optional_env("LIVY_API_KEY");
         let integration_id = env_or("LIVY_INTEGRATION_ID", DEFAULT_INTEGRATION_ID);
         let schema_id = env_or("LIVY_PROVENANCE_SCHEMA_ID", DEFAULT_SCHEMA_ID);
         let schema_version = env_or("LIVY_PROVENANCE_SCHEMA_VERSION", DEFAULT_SCHEMA_VERSION);
@@ -199,6 +219,8 @@ impl ProvenanceClient {
             env_u32("LIVY_PROVENANCE_REGISTRY_WAIT_ATTEMPTS")?.unwrap_or(30);
         let registry_wait_interval_ms =
             env_u64("LIVY_PROVENANCE_REGISTRY_WAIT_INTERVAL_MS")?.unwrap_or(2_000);
+        let legacy_service_api_key_allowed = !production_environment()
+            || env_bool("LIVY_PROVENANCE_ALLOW_SERVICE_API_KEY")?.unwrap_or(false);
 
         if !matches!(visibility.as_str(), "public" | "private") {
             return Err(ProvenanceError::InvalidEnv(
@@ -207,16 +229,21 @@ impl ProvenanceClient {
         }
 
         let livy = Livy::from_env().map_err(|err| ProvenanceError::InvalidEnv(err.to_string()))?;
-        let api = LivyProvenanceApiClient::new(ProvenanceClientConfig::with_base_url(
-            backend_base_url.clone(),
-            api_key,
-            integration_id,
-        ))?;
+        let api = api_key
+            .map(|api_key| {
+                LivyProvenanceApiClient::new(ProvenanceClientConfig::with_base_url(
+                    backend_base_url.clone(),
+                    api_key,
+                    integration_id.clone(),
+                ))
+            })
+            .transpose()?;
 
         Ok(Some(Self {
             config: ProvenanceConfig {
                 backend_base_url,
                 explorer_base_url: explorer_base_url.map(|value| trim_trailing_slash(&value)),
+                integration_id,
                 schema_id,
                 schema_version,
                 visibility,
@@ -228,8 +255,10 @@ impl ProvenanceClient {
                 wait_for_registry_refs,
                 registry_wait_attempts,
                 registry_wait_interval_ms,
+                legacy_service_api_key_allowed,
             },
             api,
+            http: reqwest::Client::new(),
             livy,
             template_ready: AtomicBool::new(false),
         }))
@@ -238,9 +267,8 @@ impl ProvenanceClient {
     pub async fn attest_fetch(
         &self,
         evidence: ResolverFetchEvidence<'_>,
+        auth_context: Option<&ResolverAuthContext>,
     ) -> Result<ProvenanceResult, ProvenanceError> {
-        self.ensure_template_if_configured().await?;
-
         let fetched_at_unix_ms = unix_millis()?;
         let source = primary_source(evidence.payload);
         let data_sha256 = sha256_json_hex(evidence.data)?;
@@ -303,7 +331,10 @@ impl ProvenanceClient {
             verification_mode: Some(self.config.verification_mode),
             attestation: serde_json::to_value(attestation)?,
             fields,
-            metadata: json!({
+            metadata: provenance_metadata(
+                auth_context,
+                &self.config.integration_id,
+                json!({
                 "application_domain": APPLICATION_DOMAIN,
                 "resolver_service": "livy-resolver",
                 "resolver_version": env!("CARGO_PKG_VERSION"),
@@ -314,26 +345,45 @@ impl ProvenanceClient {
                 "output_sha256": data_sha256,
                 "output_commitment_sha256": sha256_json_hex(&output_commitment)?,
                 "receipt_id": receipt_id,
-            }),
+                }),
+            )?,
         };
 
-        let mut record = if self.config.managed_publication {
-            let publish = managed_publication_request(
+        let publish = if self.config.managed_publication {
+            Some(managed_publication_request(
                 &request.subject_id,
                 evidence.route,
                 evidence.mode,
                 receipt_id.as_deref(),
-            );
-            self.api
-                .create_attestation_with_publication(request, publish)
+            ))
+        } else {
+            None
+        };
+
+        let used_oauth_passthrough =
+            auth_context.is_some_and(|context| context.access_token.as_deref().is_some());
+        let mut record = if let Some(context) =
+            auth_context.filter(|context| context.access_token.as_deref().is_some())
+        {
+            self.create_attestation_with_oauth_passthrough(request, publish, context)
                 .await?
         } else {
-            self.api.create_attestation(request).await?
+            let api = self.legacy_api()?;
+            self.ensure_template_if_configured().await?;
+            if let Some(publish) = publish {
+                api.create_attestation_with_publication(request, publish)
+                    .await?
+            } else {
+                api.create_attestation(request).await?
+            }
         };
         let mut registry_ref_poll_error = None;
-        if self.config.managed_publication && self.config.wait_for_registry_refs {
-            match self
-                .api
+        if self.config.managed_publication
+            && self.config.wait_for_registry_refs
+            && !used_oauth_passthrough
+        {
+            let api = self.legacy_api()?;
+            match api
                 .wait_for_registry_refs(
                     &record.provenance_attestation_id,
                     RegistryRefWaitOptions::new(
@@ -371,6 +421,94 @@ impl ProvenanceClient {
             registry_ref_poll_error,
             data_sha256,
         })
+    }
+
+    fn legacy_api(&self) -> Result<&LivyProvenanceApiClient, ProvenanceError> {
+        if !self.config.legacy_service_api_key_allowed {
+            return Err(ProvenanceError::InvalidEnv(
+                "legacy service API-key provenance writes are disabled in production; use OAuth passthrough".to_string(),
+            ));
+        }
+        self.api
+            .as_ref()
+            .ok_or(ProvenanceError::MissingEnv("LIVY_API_KEY"))
+    }
+
+    async fn create_attestation_with_oauth_passthrough(
+        &self,
+        request: CreateProvenanceAttestationRequest,
+        publish: Option<ProvenanceManagedPublicationRequest>,
+        auth_context: &ResolverAuthContext,
+    ) -> Result<ProvenanceAttestationResponse, ProvenanceError> {
+        let access_token = auth_context
+            .access_token
+            .as_deref()
+            .ok_or_else(|| ProvenanceError::InvalidEnv("missing OAuth access token".to_string()))?;
+        let mut body = self.request_body_with_integration(&request)?;
+        if let Some(publish) = publish {
+            let Value::Object(ref mut map) = body else {
+                return Err(ProvenanceError::InvalidEnv(
+                    "provenance request body must be an object".to_string(),
+                ));
+            };
+            map.insert("publish".to_string(), serde_json::to_value(publish)?);
+        }
+
+        eprintln!(
+            "provenance oauth passthrough tenant_id={} project_id={} integration_id={}",
+            auth_context.tenant_id.as_deref().unwrap_or("unknown"),
+            auth_context.project_id.as_deref().unwrap_or("unknown"),
+            self.config.integration_id
+        );
+
+        let response = self
+            .http
+            .post(self.endpoint("/api/v1/resolver/source-fetch-attestations"))
+            .headers(self.oauth_headers(access_token)?)
+            .json(&body)
+            .send()
+            .await?;
+
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(ProvenanceError::Backend { status, body });
+        }
+
+        Ok(response.json().await?)
+    }
+
+    fn request_body_with_integration<T>(&self, request: &T) -> Result<Value, ProvenanceError>
+    where
+        T: Serialize + ?Sized,
+    {
+        let mut body = serde_json::to_value(request)?;
+        let Value::Object(ref mut map) = body else {
+            return Err(ProvenanceError::InvalidEnv(
+                "provenance request body must be an object".to_string(),
+            ));
+        };
+        map.insert(
+            "integration_id".to_string(),
+            json!(self.config.integration_id.as_str()),
+        );
+        Ok(body)
+    }
+
+    fn endpoint(&self, path: &str) -> String {
+        format!("{}{}", self.config.backend_base_url, path)
+    }
+
+    fn oauth_headers(&self, access_token: &str) -> Result<HeaderMap, ProvenanceError> {
+        let mut headers = HeaderMap::new();
+        let auth = HeaderValue::from_str(&format!("Bearer {access_token}"))
+            .map_err(|err| ProvenanceError::InvalidEnv(err.to_string()))?;
+        let integration = HeaderValue::from_str(&self.config.integration_id)
+            .map_err(|err| ProvenanceError::InvalidEnv(err.to_string()))?;
+        headers.insert(AUTHORIZATION, auth);
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        headers.insert("x-integration-id", integration);
+        Ok(headers)
     }
 
     fn subject_id(
@@ -498,7 +636,7 @@ impl ProvenanceClient {
             }),
         };
 
-        self.api.upsert_template(request).await?;
+        self.legacy_api()?.upsert_template(request).await?;
 
         self.template_ready.store(true, Ordering::Release);
         Ok(())
@@ -532,6 +670,33 @@ fn managed_publication_request(
             "mode": mode_label(mode),
             "receipt_id": receipt_id,
         }))
+}
+
+fn provenance_metadata(
+    auth_context: Option<&ResolverAuthContext>,
+    integration_id: &str,
+    mut metadata: Value,
+) -> Result<Value, ProvenanceError> {
+    let Some(context) = auth_context else {
+        return Ok(metadata);
+    };
+    let Value::Object(ref mut map) = metadata else {
+        return Err(ProvenanceError::InvalidEnv(
+            "provenance metadata must be an object".to_string(),
+        ));
+    };
+    map.insert(
+        "livy_scope".to_string(),
+        json!({
+            "tenant_id": context.tenant_id.as_deref(),
+            "project_id": context.project_id.as_deref(),
+            "integration_id": integration_id,
+            "audiences": &context.audiences,
+            "scopes": &context.scopes,
+            "client_id": context.client_id.as_deref(),
+        }),
+    );
+    Ok(metadata)
 }
 
 pub(crate) fn request_summary(
@@ -858,10 +1023,6 @@ fn unix_millis() -> Result<u64, ProvenanceError> {
     u64::try_from(millis).map_err(|err| ProvenanceError::Time(err.to_string()))
 }
 
-fn required_env(name: &'static str) -> Result<String, ProvenanceError> {
-    optional_env(name).ok_or(ProvenanceError::MissingEnv(name))
-}
-
 fn optional_env(name: &str) -> Option<String> {
     std::env::var(name)
         .ok()
@@ -877,6 +1038,14 @@ fn env_present(name: &str) -> bool {
     std::env::var(name)
         .map(|value| !value.trim().is_empty())
         .unwrap_or(false)
+}
+
+fn production_environment() -> bool {
+    ["RWA_ENV", "APP_ENV", "ENVIRONMENT", "NODE_ENV"]
+        .into_iter()
+        .filter_map(|name| std::env::var(name).ok())
+        .map(|value| value.trim().to_ascii_lowercase())
+        .any(|value| value == "production")
 }
 
 fn backend_base_url_from_env() -> String {

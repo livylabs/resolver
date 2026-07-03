@@ -76,14 +76,20 @@ Configure provenance where the resolver process runs:
 ```dotenv
 LIVY_PROVENANCE_ENABLED=true
 LIVY_BACKEND_BASE_URL=https://api.livylabs.xyz
-LIVY_API_KEY=livy_...
 LIVY_INTEGRATION_ID=delphi
 ITA_API_KEY=...
 ```
 
+For OAuth-protected MCP `fetch_source`, the resolver posts provenance with
+the user's Livy OAuth bearer token to
+`/api/v1/resolver/source-fetch-attestations`; tenant/project come from the
+token claims. Do not grant ChatGPT clients generic
+`provenance:attestation:write`.
+
 Optional:
 
 ```dotenv
+LIVY_API_KEY=livy_...
 LIVY_PROVENANCE_SCHEMA_ID=resolver-fetch-v1
 LIVY_PROVENANCE_SCHEMA_VERSION=1
 LIVY_PROVENANCE_VISIBILITY=public
@@ -92,9 +98,10 @@ LIVY_EXPLORER_BASE_URL=https://api.livylabs.xyz
 LIVY_PROVENANCE_BOOTSTRAP_TEMPLATE=false
 ```
 
-Only set `LIVY_PROVENANCE_BOOTSTRAP_TEMPLATE=true` if the Livy API key
-has template write scope. Public explorer reads require the matching
-public template to exist in Livy.
+`LIVY_API_KEY` is for legacy/local service-key provenance writes. Only set
+`LIVY_PROVENANCE_BOOTSTRAP_TEMPLATE=true` if that API key has template
+write scope. Public explorer reads require the matching public template to
+exist in Livy.
 
 ## MCP Use
 

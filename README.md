@@ -44,14 +44,20 @@ Enable provenance with:
 SPIDER_API_KEY=your-spider-api-key
 LIVY_PROVENANCE_ENABLED=true
 LIVY_BACKEND_BASE_URL=https://api.livylabs.xyz
-LIVY_API_KEY=livy_...
 LIVY_INTEGRATION_ID=delphi
 ITA_API_KEY=...
 ```
 
+For OAuth-protected MCP `fetch_source` calls, provenance writes are posted to
+`/api/v1/resolver/source-fetch-attestations` with the user's Livy OAuth bearer
+token. The backend derives tenant/project from the token and rejects
+project-less resolver tokens. Do not grant ChatGPT clients generic
+`provenance:attestation:write`.
+
 Optional settings:
 
 ```dotenv
+LIVY_API_KEY=livy_...
 LIVY_PROVENANCE_SCHEMA_ID=resolver-fetch-v1
 LIVY_PROVENANCE_SCHEMA_VERSION=1
 LIVY_PROVENANCE_VISIBILITY=public
@@ -65,6 +71,10 @@ LIVY_PROVENANCE_REGISTRY_WAIT_INTERVAL_MS=2000
 ```
 
 `LIVY_BACKEND_BASE_URL` defaults to `https://api.livylabs.xyz`; set it for local or staging backends.
+
+`LIVY_API_KEY` is only used for legacy/local service-key provenance writes.
+Production service-key writes are disabled unless
+`LIVY_PROVENANCE_ALLOW_SERVICE_API_KEY=true` is set.
 
 Set `LIVY_PROVENANCE_BOOTSTRAP_TEMPLATE=true` only when the API key is
 allowed to write provenance templates. Public explorer reads also require

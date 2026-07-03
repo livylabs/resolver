@@ -1,5 +1,6 @@
 //! Spider execution layer for product routes and receipts.
 
+use crate::auth::ResolverAuthContext;
 use crate::errors::FetchError;
 use crate::provenance::{ProvenanceClient, ResolverFetchEvidence};
 use crate::snapshot_upload::SnapshotPayload;
@@ -50,6 +51,15 @@ impl Fetcher {
         &self,
         payload: ProductRequest,
         route: ProductRoute,
+    ) -> Result<ProductResponse, FetchError> {
+        self.product_fetch_with_auth(payload, route, None).await
+    }
+
+    pub async fn product_fetch_with_auth(
+        &self,
+        payload: ProductRequest,
+        route: ProductRoute,
+        auth_context: Option<&ResolverAuthContext>,
     ) -> Result<ProductResponse, FetchError> {
         let mode = self.resolve_mode(payload.mode, route);
         let timeout_secs = payload.timeout_secs.unwrap_or_else(|| match mode {
@@ -116,7 +126,7 @@ impl Fetcher {
         };
 
         let (provenance, provenance_error) = self
-            .provenance_for(&payload, route, mode, &data, receipt.as_ref())
+            .provenance_for(&payload, route, mode, &data, receipt.as_ref(), auth_context)
             .await;
 
         Ok(ProductResponse {
@@ -134,8 +144,19 @@ impl Fetcher {
         &self,
         source: &str,
     ) -> Result<FetchWithReceipt, FetchError> {
+        self.get_fast_data_with_receipt_with_auth(source, None)
+            .await
+    }
+
+    pub async fn get_fast_data_with_receipt_with_auth(
+        &self,
+        source: &str,
+        auth_context: Option<&ResolverAuthContext>,
+    ) -> Result<FetchWithReceipt, FetchError> {
         let payload = ProductRequest::fast(source);
-        let response = self.product_fetch(payload, ProductRoute::Scrape).await?;
+        let response = self
+            .product_fetch_with_auth(payload, ProductRoute::Scrape, auth_context)
+            .await?;
         let crawl = response.data;
         let receipt = response
             .receipt
@@ -193,19 +214,23 @@ impl Fetcher {
         mode: ProductMode,
         data: &Value,
         receipt: Option<&Receipt>,
+        auth_context: Option<&ResolverAuthContext>,
     ) -> (Option<crate::provenance::ProvenanceResult>, Option<String>) {
         let Some(provenance) = self.provenance.as_ref() else {
             return (None, None);
         };
 
         match provenance
-            .attest_fetch(ResolverFetchEvidence {
-                payload,
-                route,
-                mode,
-                data,
-                receipt,
-            })
+            .attest_fetch(
+                ResolverFetchEvidence {
+                    payload,
+                    route,
+                    mode,
+                    data,
+                    receipt,
+                },
+                auth_context,
+            )
             .await
         {
             Ok(result) => (Some(result), None),
