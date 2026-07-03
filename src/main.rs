@@ -56,6 +56,7 @@ async fn main() -> Result<()> {
         ));
 
     let mcp_routes = Router::new()
+        .route_service("/", mcp_service.clone())
         .nest_service("/mcp", mcp_service)
         .route_layer(middleware::from_fn(mcp::mirror_tools_list_security_schemes));
 
