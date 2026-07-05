@@ -31,6 +31,7 @@ async fn main() -> Result<()> {
     let mcp_auth = resolver_auth.clone();
     let metadata_auth = resolver_auth.clone();
     let mcp_metadata_auth = resolver_auth.clone();
+    let mcp_challenge_auth = resolver_auth.clone();
 
     let mcp_service = StreamableHttpService::new(
         move || Ok(mcp::Server::new(mcp_fetcher.clone(), mcp_auth.clone())),
@@ -58,6 +59,10 @@ async fn main() -> Result<()> {
     let mcp_routes = Router::new()
         .route_service("/", mcp_service.clone())
         .nest_service("/mcp", mcp_service)
+        .route_layer(middleware::from_fn_with_state(
+            mcp_challenge_auth,
+            mcp::challenge_protected_mcp_requests,
+        ))
         .route_layer(middleware::from_fn(mcp::mirror_tools_list_security_schemes));
 
     let app = Router::new()

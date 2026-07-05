@@ -23,8 +23,10 @@ cargo run
 The service listens on `http://localhost:3001` unless `PORT` or
 `RESOLVER_PORT` is set.
 
-Product routes and MCP `tools/call` require a Livy OAuth bearer token by default.
-MCP `tools/list` remains public for connector discovery. Local-only
+Product routes and protected MCP requests require a Livy OAuth bearer token by default.
+MCP `initialize`, `notifications/initialized`, and `tools/list` remain public for connector discovery.
+Unauthenticated MCP probes and `tools/call` return HTTP `401` with `WWW-Authenticate`
+so Claude can discover the OAuth protected resource. Local-only
 unauthenticated development can set `LIVY_RESOLVER_AUTH_ENABLED=false`.
 
 ```dotenv
@@ -146,8 +148,8 @@ Prefer `/fetch` with `mode` over the compat routes.
 - Protected resource metadata: `/.well-known/oauth-protected-resource` and `/.well-known/oauth-protected-resource/mcp`, including `resource_name` and the Livy OAuth introspection endpoint
 - Server: `livygensyn-source-fetcher`
 - Tool: `fetch_source` — input `{ "url": "..." }`
-- Auth: `tools/call` requires `Authorization: Bearer <livy_oauth_access_token>` with `tool:fetch_source` or `mcp` scope and the resolver audience
-- Discovery: unauthenticated `tools/list` is allowed so clients can read the tool descriptor; unauthenticated `fetch_source` calls return `_meta["mcp/www_authenticate"]` with the protected-resource metadata URL, required scope, `error="invalid_request"`, and an error description
+- Auth: protected MCP requests require `Authorization: Bearer <livy_oauth_access_token>` with `tool:fetch_source` or `mcp` scope and the resolver audience
+- Discovery: unauthenticated `initialize`, `notifications/initialized`, and `tools/list` are allowed so clients can read the tool descriptor; unauthenticated MCP probes and `fetch_source` calls return HTTP `401` with `WWW-Authenticate` pointing at the protected-resource metadata URL. The tool implementation keeps `_meta["mcp/www_authenticate"]` compatibility for contexts that reach tool dispatch directly.
 - ChatGPT metadata: the `fetch_source` tool descriptor includes top-level `title` and `securitySchemes`, `_meta.securitySchemes`, short invocation status text, and read-only/open-world annotations
 
 Use when the prompt contains `source: <url>`, "only take this source", "source of truth", or an explicitly required URL. Pass the exact URL, don't search or substitute.

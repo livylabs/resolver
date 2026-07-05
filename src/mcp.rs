@@ -4,8 +4,10 @@ use crate::auth::{ResolverAuth, ResolverAuthContext, ResolverAuthError};
 use crate::fetch::Fetcher;
 use crate::types::FetchWithReceipt;
 use axum::{
+    Json,
     body::{Body, to_bytes},
-    http::{Request, StatusCode, header, request::Parts},
+    extract::State,
+    http::{Method, Request, StatusCode, header, request::Parts},
     middleware::Next,
     response::{IntoResponse, Response},
 };
@@ -92,6 +94,115 @@ impl Server {
         result.content = vec![Content::text(text)];
         Ok(result)
     }
+}
+
+pub async fn challenge_protected_mcp_requests(
+    State(auth): State<Arc<ResolverAuth>>,
+    request: Request<Body>,
+    next: Next,
+) -> Response {
+    if request.method() != Method::POST {
+        return require_mcp_oauth_or_challenge(auth, request, next).await;
+    }
+
+    let (parts, body) = request.into_parts();
+    let body_bytes = match to_bytes(body, MCP_COMPAT_BODY_LIMIT).await {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            return (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "MCP request body is too large for OAuth compatibility handling",
+            )
+                .into_response();
+        }
+    };
+    let requires_oauth = mcp_post_requires_http_oauth(&body_bytes);
+    let request = Request::from_parts(parts, Body::from(body_bytes));
+
+    if requires_oauth {
+        require_mcp_oauth_or_challenge(auth, request, next).await
+    } else {
+        next.run(request).await
+    }
+}
+
+async fn require_mcp_oauth_or_challenge(
+    auth: Arc<ResolverAuth>,
+    request: Request<Body>,
+    next: Next,
+) -> Response {
+    match auth
+        .validate_authorization_header(
+            request.headers().get(header::AUTHORIZATION),
+            FETCH_SOURCE_SCOPES,
+        )
+        .await
+    {
+        Ok(_) => next.run(request).await,
+        Err(ResolverAuthError::ServiceUnavailable(err)) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "error": err })),
+        )
+            .into_response(),
+        Err(err) => {
+            let Some((error, message)) = err.challenge_parts() else {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({ "error": "OAuth validation failed" })),
+                )
+                    .into_response();
+            };
+            let status = match err {
+                ResolverAuthError::Unauthorized { .. } => StatusCode::UNAUTHORIZED,
+                ResolverAuthError::Forbidden { .. } => StatusCode::FORBIDDEN,
+                ResolverAuthError::ServiceUnavailable(_) => unreachable!(),
+            };
+            mcp_http_oauth_challenge_response(&auth, status, error, message)
+        }
+    }
+}
+
+fn mcp_http_oauth_challenge_response(
+    auth: &ResolverAuth,
+    status: StatusCode,
+    error: &'static str,
+    message: &'static str,
+) -> Response {
+    let mut response = (status, Json(json!({ "error": message }))).into_response();
+    if let Ok(value) = auth.challenge(FETCH_SOURCE_SCOPES, error, message).parse() {
+        response
+            .headers_mut()
+            .insert(header::WWW_AUTHENTICATE, value);
+    }
+    response
+}
+
+fn mcp_post_requires_http_oauth(body: &[u8]) -> bool {
+    let Ok(value) = serde_json::from_slice::<Value>(body) else {
+        return true;
+    };
+
+    !mcp_message_is_public_discovery(&value)
+}
+
+fn mcp_message_is_public_discovery(value: &Value) -> bool {
+    match value {
+        Value::Object(object) => object
+            .get("method")
+            .and_then(Value::as_str)
+            .is_some_and(public_mcp_discovery_method),
+        Value::Array(messages) if !messages.is_empty() => {
+            messages.iter().all(mcp_message_is_public_discovery)
+        }
+        _ => false,
+    }
+}
+
+fn public_mcp_discovery_method(method: &str) -> bool {
+    matches!(
+        method,
+        "initialize" | "notifications/initialized" | "tools/list" | "ping"
+    ) || method.starts_with("notifications/")
 }
 
 pub async fn mirror_tools_list_security_schemes(request: Request<Body>, next: Next) -> Response {
@@ -497,8 +608,12 @@ impl ServerHandler for Server {}
 
 #[cfg(test)]
 mod tests {
-    use super::{FETCH_SOURCE_SCOPES, Server, oauth_challenge_result};
+    use super::{
+        FETCH_SOURCE_SCOPES, Server, mcp_http_oauth_challenge_response,
+        mcp_post_requires_http_oauth, oauth_challenge_result,
+    };
     use crate::auth::ResolverAuth;
+    use axum::{body::to_bytes, http::header};
     use serde_json::json;
 
     #[test]
@@ -580,6 +695,64 @@ mod tests {
         assert!(challenge.contains("scope=\"tool:fetch_source\""));
         assert!(challenge.contains("error=\"invalid_request\""));
         assert!(challenge.contains("error_description=\"missing bearer token\""));
+    }
+
+    #[tokio::test]
+    async fn http_oauth_challenge_response_sets_www_authenticate_header() {
+        let auth = ResolverAuth::for_tests();
+        let response = mcp_http_oauth_challenge_response(
+            &auth,
+            axum::http::StatusCode::UNAUTHORIZED,
+            "invalid_request",
+            "missing bearer token",
+        );
+
+        assert_eq!(response.status(), axum::http::StatusCode::UNAUTHORIZED);
+        let challenge = response
+            .headers()
+            .get(header::WWW_AUTHENTICATE)
+            .and_then(|value| value.to_str().ok())
+            .expect("WWW-Authenticate header should be set");
+        assert!(challenge.starts_with("Bearer "));
+        assert!(challenge.contains(
+            "resource_metadata=\"https://resolver.api.livylabs.xyz/.well-known/oauth-protected-resource\""
+        ));
+        assert!(challenge.contains("scope=\"tool:fetch_source\""));
+        assert!(challenge.contains("error=\"invalid_request\""));
+
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("response body");
+        let payload: serde_json::Value = serde_json::from_slice(&body).expect("json body");
+        assert_eq!(payload["error"], "missing bearer token");
+    }
+
+    #[test]
+    fn public_mcp_discovery_requests_do_not_require_http_oauth() {
+        assert!(!mcp_post_requires_http_oauth(
+            br#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#
+        ));
+        assert!(!mcp_post_requires_http_oauth(
+            br#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#
+        ));
+        assert!(!mcp_post_requires_http_oauth(
+            br#"{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}"#
+        ));
+        assert!(!mcp_post_requires_http_oauth(
+            br#"[{"jsonrpc":"2.0","id":1,"method":"initialize"},{"jsonrpc":"2.0","id":2,"method":"tools/list"}]"#
+        ));
+    }
+
+    #[test]
+    fn protected_mcp_calls_require_http_oauth() {
+        assert!(mcp_post_requires_http_oauth(
+            br#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"fetch_source","arguments":{"url":"https://example.com"}}}"#
+        ));
+        assert!(mcp_post_requires_http_oauth(
+            br#"[{"jsonrpc":"2.0","id":1,"method":"initialize"},{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"fetch_source","arguments":{"url":"https://example.com"}}}]"#
+        ));
+        assert!(mcp_post_requires_http_oauth(br#"not-json"#));
+        assert!(mcp_post_requires_http_oauth(br#"[]"#));
     }
 
     #[test]
