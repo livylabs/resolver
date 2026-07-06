@@ -7,7 +7,7 @@ use axum::{
     Json,
     body::{Body, to_bytes},
     extract::State,
-    http::{Method, Request, StatusCode, header, request::Parts},
+    http::{Request, StatusCode, header, request::Parts},
     middleware::Next,
     response::{IntoResponse, Response},
 };
@@ -101,29 +101,7 @@ pub async fn challenge_protected_mcp_requests(
     request: Request<Body>,
     next: Next,
 ) -> Response {
-    if request.method() != Method::POST {
-        return require_mcp_oauth_or_challenge(auth, request, next).await;
-    }
-
-    let (parts, body) = request.into_parts();
-    let body_bytes = match to_bytes(body, MCP_COMPAT_BODY_LIMIT).await {
-        Ok(bytes) => bytes,
-        Err(_) => {
-            return (
-                StatusCode::PAYLOAD_TOO_LARGE,
-                "MCP request body is too large for OAuth compatibility handling",
-            )
-                .into_response();
-        }
-    };
-    let requires_oauth = mcp_post_requires_http_oauth(&body_bytes);
-    let request = Request::from_parts(parts, Body::from(body_bytes));
-
-    if requires_oauth {
-        require_mcp_oauth_or_challenge(auth, request, next).await
-    } else {
-        next.run(request).await
-    }
+    require_mcp_oauth_or_challenge(auth, request, next).await
 }
 
 async fn require_mcp_oauth_or_challenge(
@@ -175,34 +153,6 @@ fn mcp_http_oauth_challenge_response(
             .insert(header::WWW_AUTHENTICATE, value);
     }
     response
-}
-
-fn mcp_post_requires_http_oauth(body: &[u8]) -> bool {
-    let Ok(value) = serde_json::from_slice::<Value>(body) else {
-        return true;
-    };
-
-    !mcp_message_is_public_discovery(&value)
-}
-
-fn mcp_message_is_public_discovery(value: &Value) -> bool {
-    match value {
-        Value::Object(object) => object
-            .get("method")
-            .and_then(Value::as_str)
-            .is_some_and(public_mcp_discovery_method),
-        Value::Array(messages) if !messages.is_empty() => {
-            messages.iter().all(mcp_message_is_public_discovery)
-        }
-        _ => false,
-    }
-}
-
-fn public_mcp_discovery_method(method: &str) -> bool {
-    matches!(
-        method,
-        "initialize" | "notifications/initialized" | "tools/list" | "ping"
-    ) || method.starts_with("notifications/")
 }
 
 pub async fn mirror_tools_list_security_schemes(request: Request<Body>, next: Next) -> Response {
@@ -609,8 +559,7 @@ impl ServerHandler for Server {}
 #[cfg(test)]
 mod tests {
     use super::{
-        FETCH_SOURCE_SCOPES, Server, mcp_http_oauth_challenge_response,
-        mcp_post_requires_http_oauth, oauth_challenge_result,
+        FETCH_SOURCE_SCOPES, Server, mcp_http_oauth_challenge_response, oauth_challenge_result,
     };
     use crate::auth::ResolverAuth;
     use axum::{body::to_bytes, http::header};
@@ -725,34 +674,6 @@ mod tests {
             .expect("response body");
         let payload: serde_json::Value = serde_json::from_slice(&body).expect("json body");
         assert_eq!(payload["error"], "missing bearer token");
-    }
-
-    #[test]
-    fn public_mcp_discovery_requests_do_not_require_http_oauth() {
-        assert!(!mcp_post_requires_http_oauth(
-            br#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#
-        ));
-        assert!(!mcp_post_requires_http_oauth(
-            br#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#
-        ));
-        assert!(!mcp_post_requires_http_oauth(
-            br#"{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}"#
-        ));
-        assert!(!mcp_post_requires_http_oauth(
-            br#"[{"jsonrpc":"2.0","id":1,"method":"initialize"},{"jsonrpc":"2.0","id":2,"method":"tools/list"}]"#
-        ));
-    }
-
-    #[test]
-    fn protected_mcp_calls_require_http_oauth() {
-        assert!(mcp_post_requires_http_oauth(
-            br#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"fetch_source","arguments":{"url":"https://example.com"}}}"#
-        ));
-        assert!(mcp_post_requires_http_oauth(
-            br#"[{"jsonrpc":"2.0","id":1,"method":"initialize"},{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"fetch_source","arguments":{"url":"https://example.com"}}}]"#
-        ));
-        assert!(mcp_post_requires_http_oauth(br#"not-json"#));
-        assert!(mcp_post_requires_http_oauth(br#"[]"#));
     }
 
     #[test]

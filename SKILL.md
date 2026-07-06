@@ -105,10 +105,9 @@ exist in Livy.
 
 ## MCP Use
 
-OAuth is enabled by default. Public MCP discovery is limited to
-`initialize`, `notifications/initialized`, and `tools/list`; unauthenticated
-MCP probes and protected `tools/call` requests return HTTP `401` with
-`WWW-Authenticate` pointing at `/.well-known/oauth-protected-resource`.
+OAuth is enabled by default. Unauthenticated MCP requests, including
+`initialize`, `notifications/initialized`, and `tools/list`, return HTTP `401`
+with `WWW-Authenticate` pointing at `/.well-known/oauth-protected-resource`.
 The protected-resource metadata `resource` must match the public MCP URL,
 such as `https://resolver.api.livylabs.xyz/mcp`, because Claude matches the
 registered connector URL exactly during OAuth discovery.
