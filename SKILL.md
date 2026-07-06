@@ -105,6 +105,13 @@ exist in Livy.
 
 ## MCP Use
 
+OAuth is enabled by default. Public MCP discovery is limited to
+`initialize`, `notifications/initialized`, and `tools/list`; unauthenticated
+MCP probes and protected `tools/call` requests return HTTP `401` with
+`WWW-Authenticate` pointing at `/.well-known/oauth-protected-resource`.
+Set `LIVY_RESOLVER_AUTH_ENABLED=false` only for local unauthenticated
+development.
+
 Use `fetch_source` when the user gives an exact URL as the required
 source:
 
