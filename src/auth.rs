@@ -15,7 +15,8 @@ use std::time::Duration;
 
 const DEFAULT_INTROSPECTION_URL: &str = "https://auth.livylabs.xyz/oauth/introspect";
 const DEFAULT_AUTHORIZATION_SERVER: &str = "https://auth.livylabs.xyz";
-const DEFAULT_RESOLVER_AUDIENCE: &str = "https://resolver.api.livylabs.xyz";
+const DEFAULT_RESOLVER_AUDIENCE: &str = "https://resolver.api.livylabs.xyz/mcp";
+const LEGACY_RESOLVER_AUDIENCE: &str = "https://resolver.api.livylabs.xyz";
 
 #[derive(Clone)]
 pub struct ResolverAuth {
@@ -24,6 +25,7 @@ pub struct ResolverAuth {
     introspection_url: String,
     authorization_server: String,
     audience: String,
+    accepted_audiences: Vec<String>,
     resource_metadata_url: String,
 }
 
@@ -82,8 +84,14 @@ impl ResolverAuth {
         let resource_metadata_url = normalize_url_identifier(
             env_value("LIVY_RESOLVER_OAUTH_RESOURCE_METADATA_URL")
                 .or_else(|| env_value("RWA_RESOLVER_OAUTH_RESOURCE_METADATA_URL"))
-                .unwrap_or_else(|| format!("{audience}/.well-known/oauth-protected-resource")),
+                .unwrap_or_else(|| {
+                    format!(
+                        "{}/.well-known/oauth-protected-resource",
+                        LEGACY_RESOLVER_AUDIENCE
+                    )
+                }),
         );
+        let accepted_audiences = accepted_audiences(&audience);
 
         Self {
             enabled: auth_enabled(),
@@ -102,6 +110,7 @@ impl ResolverAuth {
                     .unwrap_or_else(|| DEFAULT_AUTHORIZATION_SERVER.to_string()),
             ),
             audience,
+            accepted_audiences,
             resource_metadata_url,
         }
     }
@@ -129,10 +138,12 @@ impl ResolverAuth {
     }
 
     fn audience_allowed(&self, audiences: &[String]) -> bool {
-        if self.audience.is_empty() {
+        if self.accepted_audiences.is_empty() {
             return true;
         }
-        audiences.iter().any(|audience| audience == &self.audience)
+        audiences
+            .iter()
+            .any(|audience| self.accepted_audiences.contains(audience))
     }
 
     pub fn challenge(&self, required_scopes: &[&str], error: &str, description: &str) -> String {
@@ -231,7 +242,11 @@ impl ResolverAuth {
                 .expect("client"),
             introspection_url: "https://auth.livylabs.xyz/oauth/introspect".to_string(),
             authorization_server: "https://auth.livylabs.xyz".to_string(),
-            audience: "https://resolver.api.livylabs.xyz".to_string(),
+            audience: "https://resolver.api.livylabs.xyz/mcp".to_string(),
+            accepted_audiences: vec![
+                "https://resolver.api.livylabs.xyz/mcp".to_string(),
+                "https://resolver.api.livylabs.xyz".to_string(),
+            ],
             resource_metadata_url:
                 "https://resolver.api.livylabs.xyz/.well-known/oauth-protected-resource".to_string(),
         }
@@ -354,6 +369,22 @@ fn audience_values(value: Option<&AudienceValue>) -> Vec<String> {
     }
 }
 
+fn accepted_audiences(primary: &str) -> Vec<String> {
+    let mut audiences = vec![primary.to_string()];
+    if let Some(value) = env_value("LIVY_RESOLVER_OAUTH_ACCEPTED_AUDIENCES")
+        .or_else(|| env_value("RWA_RESOLVER_OAUTH_ACCEPTED_AUDIENCES"))
+    {
+        audiences.extend(
+            parse_space_or_comma_list(&value)
+                .into_iter()
+                .map(normalize_url_identifier),
+        );
+    } else {
+        audiences.push(LEGACY_RESOLVER_AUDIENCE.to_string());
+    }
+    normalize_unique_list(audiences)
+}
+
 fn resolver_scopes_supported() -> Vec<&'static str> {
     vec![
         "mcp",
@@ -389,6 +420,25 @@ fn env_value(name: &str) -> Option<String> {
 
 fn normalize_url_identifier(value: String) -> String {
     value.trim().trim_end_matches('/').to_string()
+}
+
+fn parse_space_or_comma_list(value: &str) -> Vec<String> {
+    value
+        .split(|ch: char| ch.is_ascii_whitespace() || ch == ',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+fn normalize_unique_list(values: Vec<String>) -> Vec<String> {
+    let mut normalized = Vec::new();
+    for value in values.into_iter().map(normalize_url_identifier) {
+        if !value.is_empty() && !normalized.contains(&value) {
+            normalized.push(value);
+        }
+    }
+    normalized
 }
 
 fn non_empty(value: Option<String>) -> Option<String> {
@@ -485,7 +535,11 @@ mod tests {
                 .expect("client"),
             introspection_url: "https://auth.livylabs.xyz/oauth/introspect".to_string(),
             authorization_server: "https://auth.livylabs.xyz".to_string(),
-            audience: "https://resolver.api.livylabs.xyz".to_string(),
+            audience: "https://resolver.api.livylabs.xyz/mcp".to_string(),
+            accepted_audiences: vec![
+                "https://resolver.api.livylabs.xyz/mcp".to_string(),
+                "https://resolver.api.livylabs.xyz".to_string(),
+            ],
             resource_metadata_url:
                 "https://resolver.api.livylabs.xyz/.well-known/oauth-protected-resource".to_string(),
         };
@@ -514,7 +568,11 @@ mod tests {
                 .expect("client"),
             introspection_url: "https://auth.livylabs.xyz/oauth/introspect".to_string(),
             authorization_server: "https://auth.livylabs.xyz".to_string(),
-            audience: "https://resolver.api.livylabs.xyz".to_string(),
+            audience: "https://resolver.api.livylabs.xyz/mcp".to_string(),
+            accepted_audiences: vec![
+                "https://resolver.api.livylabs.xyz/mcp".to_string(),
+                "https://resolver.api.livylabs.xyz".to_string(),
+            ],
             resource_metadata_url:
                 "https://resolver.api.livylabs.xyz/.well-known/oauth-protected-resource".to_string(),
         };
@@ -523,6 +581,10 @@ mod tests {
 
         assert_eq!(metadata["resource_name"], "Livy Resolver");
         assert_eq!(
+            metadata["resource"],
+            "https://resolver.api.livylabs.xyz/mcp"
+        );
+        assert_eq!(
             metadata["introspection_endpoint"],
             "https://auth.livylabs.xyz/oauth/introspect"
         );
@@ -530,6 +592,30 @@ mod tests {
             metadata["bearer_methods_supported"],
             serde_json::json!(["header"])
         );
+    }
+
+    #[test]
+    fn audience_check_accepts_current_and_legacy_resolver_audiences() {
+        let auth = ResolverAuth {
+            enabled: true,
+            client: reqwest::Client::builder()
+                .timeout(Duration::from_secs(1))
+                .build()
+                .expect("client"),
+            introspection_url: "https://auth.livylabs.xyz/oauth/introspect".to_string(),
+            authorization_server: "https://auth.livylabs.xyz".to_string(),
+            audience: "https://resolver.api.livylabs.xyz/mcp".to_string(),
+            accepted_audiences: vec![
+                "https://resolver.api.livylabs.xyz/mcp".to_string(),
+                "https://resolver.api.livylabs.xyz".to_string(),
+            ],
+            resource_metadata_url:
+                "https://resolver.api.livylabs.xyz/.well-known/oauth-protected-resource".to_string(),
+        };
+
+        assert!(auth.audience_allowed(&["https://resolver.api.livylabs.xyz/mcp".to_string()]));
+        assert!(auth.audience_allowed(&["https://resolver.api.livylabs.xyz".to_string()]));
+        assert!(!auth.audience_allowed(&["https://api.livylabs.xyz".to_string()]));
     }
 
     #[test]

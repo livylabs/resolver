@@ -109,6 +109,9 @@ OAuth is enabled by default. Public MCP discovery is limited to
 `initialize`, `notifications/initialized`, and `tools/list`; unauthenticated
 MCP probes and protected `tools/call` requests return HTTP `401` with
 `WWW-Authenticate` pointing at `/.well-known/oauth-protected-resource`.
+The protected-resource metadata `resource` must match the public MCP URL,
+such as `https://resolver.api.livylabs.xyz/mcp`, because Claude matches the
+registered connector URL exactly during OAuth discovery.
 Set `LIVY_RESOLVER_AUTH_ENABLED=false` only for local unauthenticated
 development.
 

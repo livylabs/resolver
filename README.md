@@ -32,7 +32,7 @@ unauthenticated development can set `LIVY_RESOLVER_AUTH_ENABLED=false`.
 ```dotenv
 LIVY_OAUTH_ISSUER=https://auth.livylabs.xyz
 LIVY_OAUTH_INTROSPECTION_URL=https://auth.livylabs.xyz/oauth/introspect
-LIVY_RESOLVER_OAUTH_AUDIENCE=https://resolver.api.livylabs.xyz
+LIVY_RESOLVER_OAUTH_AUDIENCE=https://resolver.api.livylabs.xyz/mcp
 LIVY_RESOLVER_OAUTH_RESOURCE_METADATA_URL=https://resolver.api.livylabs.xyz/.well-known/oauth-protected-resource
 ```
 
@@ -148,7 +148,7 @@ Prefer `/fetch` with `mode` over the compat routes.
 - Protected resource metadata: `/.well-known/oauth-protected-resource` and `/.well-known/oauth-protected-resource/mcp`, including `resource_name` and the Livy OAuth introspection endpoint
 - Server: `livygensyn-source-fetcher`
 - Tool: `fetch_source` — input `{ "url": "..." }`
-- Auth: protected MCP requests require `Authorization: Bearer <livy_oauth_access_token>` with `tool:fetch_source` or `mcp` scope and the resolver audience
+- Auth: protected MCP requests require `Authorization: Bearer <livy_oauth_access_token>` with `tool:fetch_source` or `mcp` scope and the resolver MCP endpoint audience
 - Discovery: unauthenticated `initialize`, `notifications/initialized`, and `tools/list` are allowed so clients can read the tool descriptor; unauthenticated MCP probes and `fetch_source` calls return HTTP `401` with `WWW-Authenticate` pointing at the protected-resource metadata URL. The tool implementation keeps `_meta["mcp/www_authenticate"]` compatibility for contexts that reach tool dispatch directly.
 - ChatGPT metadata: the `fetch_source` tool descriptor includes top-level `title` and `securitySchemes`, `_meta.securitySchemes`, short invocation status text, and read-only/open-world annotations
 
