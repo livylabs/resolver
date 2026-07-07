@@ -1,6 +1,7 @@
 //! Livy provenance client for resolver fetch attestations.
 
 use crate::auth::ResolverAuthContext;
+use crate::errors::ProvenanceError;
 use crate::types::{
     FormatSelection, ProductFormat, ProductMode, ProductProxy, ProductRequest, ProductRoute,
     Receipt,
@@ -8,20 +9,16 @@ use crate::types::{
 use livy_provenance_sdk::{
     CreateProvenanceAttestationRequest, DEFAULT_LIVY_API_BASE_URL, ProvenanceAttestationField,
     ProvenanceAttestationResponse, ProvenanceClient as LivyProvenanceApiClient,
-    ProvenanceClientConfig, ProvenanceClientError, ProvenanceCommitMode, ProvenanceFieldDisclosure,
+    ProvenanceClientConfig, ProvenanceCommitMode, ProvenanceFieldDisclosure,
     ProvenanceManagedPublicationRequest, ProvenanceRegistryRefResponse, ProvenanceTemplateField,
     ProvenanceVerificationMode, RegistryRefWaitOptions, UpsertProvenanceTemplateRequest,
 };
 use livy_tee::Livy;
-use reqwest::{
-    StatusCode,
-    header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue},
-};
+use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{
-    fmt,
     sync::atomic::{AtomicBool, Ordering},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -128,55 +125,6 @@ impl From<&ProvenanceRegistryRefResponse> for ProvenanceRegistryRef {
             explorer_links: record.explorer_links.clone(),
             registered_at: record.registered_at.clone(),
         }
-    }
-}
-
-#[derive(Debug)]
-pub enum ProvenanceError {
-    MissingEnv(&'static str),
-    InvalidEnv(String),
-    Sdk(ProvenanceClientError),
-    Http(reqwest::Error),
-    Backend { status: StatusCode, body: String },
-    Json(serde_json::Error),
-    Attestation(String),
-    Time(String),
-}
-
-impl fmt::Display for ProvenanceError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::MissingEnv(name) => write!(f, "{name} must be set when provenance is enabled"),
-            Self::InvalidEnv(message) => write!(f, "invalid provenance configuration: {message}"),
-            Self::Sdk(err) => write!(f, "provenance SDK failed: {err}"),
-            Self::Http(err) => write!(f, "provenance HTTP request failed: {err}"),
-            Self::Backend { status, body } => {
-                write!(f, "provenance backend returned {status}: {body}")
-            }
-            Self::Json(err) => write!(f, "provenance JSON handling failed: {err}"),
-            Self::Attestation(err) => write!(f, "provenance attestation failed: {err}"),
-            Self::Time(err) => write!(f, "provenance timestamp failed: {err}"),
-        }
-    }
-}
-
-impl std::error::Error for ProvenanceError {}
-
-impl From<ProvenanceClientError> for ProvenanceError {
-    fn from(err: ProvenanceClientError) -> Self {
-        Self::Sdk(err)
-    }
-}
-
-impl From<serde_json::Error> for ProvenanceError {
-    fn from(err: serde_json::Error) -> Self {
-        Self::Json(err)
-    }
-}
-
-impl From<reqwest::Error> for ProvenanceError {
-    fn from(err: reqwest::Error) -> Self {
-        Self::Http(err)
     }
 }
 

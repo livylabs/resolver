@@ -1,10 +1,10 @@
-//! HTTP error mapping for product and upstream failures.
+//! Central error definitions and HTTP mapping for resolver failures.
 
-use crate::snapshot_upload::SnapshotError;
 use axum::{
     http::StatusCode,
     response::{IntoResponse, Json, Response},
 };
+use livy_provenance_sdk::ProvenanceClientError;
 use serde_json::json;
 use thiserror::Error;
 
@@ -32,6 +32,81 @@ pub enum FetchError {
     Credits(String),
     #[error("Snapshot failed")]
     Snapshot(#[from] SnapshotError),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResolverAuthError {
+    Unauthorized {
+        error: &'static str,
+        message: &'static str,
+    },
+    Forbidden {
+        error: &'static str,
+        message: &'static str,
+    },
+    ServiceUnavailable(String),
+}
+
+impl ResolverAuthError {
+    pub fn challenge_parts(&self) -> Option<(&'static str, &'static str)> {
+        match self {
+            ResolverAuthError::Unauthorized { error, message }
+            | ResolverAuthError::Forbidden { error, message } => Some((error, message)),
+            ResolverAuthError::ServiceUnavailable(_) => None,
+        }
+    }
+}
+
+#[derive(Debug, Error)]
+pub enum ResolverCreditsError {
+    #[error("OAuth context is missing Livy {0}")]
+    MissingAuth(&'static str),
+    #[error("credit request header is invalid: {0}")]
+    InvalidHeader(String),
+    #[error("credit request failed: {0}")]
+    Http(reqwest::Error),
+    #[error("credit request returned {status}: {}", compact_body(body))]
+    Backend { status: StatusCode, body: String },
+}
+
+impl ResolverCreditsError {
+    pub fn is_payment_required(&self) -> bool {
+        match self {
+            Self::Backend { status, body } => {
+                *status == StatusCode::PAYMENT_REQUIRED
+                    || backend_error_code(body).as_deref() == Some("insufficient_user_credits")
+            }
+            _ => false,
+        }
+    }
+}
+
+#[derive(Debug, Error)]
+pub enum ProvenanceError {
+    #[error("{0} must be set when provenance is enabled")]
+    MissingEnv(&'static str),
+    #[error("invalid provenance configuration: {0}")]
+    InvalidEnv(String),
+    #[error("provenance SDK failed: {0}")]
+    Sdk(#[from] ProvenanceClientError),
+    #[error("provenance HTTP request failed: {0}")]
+    Http(#[from] reqwest::Error),
+    #[error("provenance backend returned {status}: {body}")]
+    Backend { status: StatusCode, body: String },
+    #[error("provenance JSON handling failed: {0}")]
+    Json(#[from] serde_json::Error),
+    #[error("provenance attestation failed: {0}")]
+    Attestation(String),
+    #[error("provenance timestamp failed: {0}")]
+    Time(String),
+}
+
+#[derive(Debug, Error)]
+pub enum SnapshotError {
+    #[error("Spider snapshot response did not include raw HTML")]
+    MissingHtml,
+    #[error("Spider snapshot response did not include a screenshot")]
+    MissingScreenshot,
 }
 
 impl IntoResponse for FetchError {
@@ -78,4 +153,23 @@ impl IntoResponse for FetchError {
         };
         (status, body).into_response()
     }
+}
+
+fn backend_error_code(body: &str) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("code")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        })
+}
+
+fn compact_body(body: &str) -> String {
+    let body = body.trim();
+    if body.len() <= 512 {
+        return body.to_string();
+    }
+    format!("{}...", &body[..512])
 }

@@ -1,7 +1,8 @@
 //! MCP tool wrapper for exact source fetching.
 
-use crate::auth::{ResolverAuth, ResolverAuthContext, ResolverAuthError};
+use crate::auth::{ResolverAuth, ResolverAuthContext};
 use crate::credits::ResolverCreditsClient;
+use crate::errors::ResolverAuthError;
 use crate::fetch::Fetcher;
 use crate::types::FetchWithReceipt;
 use axum::{
@@ -20,13 +21,20 @@ use rmcp::{
     schemars, tool, tool_handler, tool_router,
 };
 use serde_json::{Value, json};
-use std::{fmt::Write, sync::Arc, time::Instant};
+use std::{
+    collections::HashMap,
+    fmt::Write,
+    sync::{Arc, Mutex},
+    time::{Duration, Instant},
+};
 
 const FETCH_SOURCE_SCOPES: &[&str] = &["tool:fetch_source", "resolver:source:fetch"];
 const FETCH_SOURCE_TITLE: &str = "Fetch Source";
 const FETCH_SOURCE_INVOCATION_START: &str = "Fetching source";
 const FETCH_SOURCE_INVOCATION_DONE: &str = "Source fetched";
 const MCP_COMPAT_BODY_LIMIT: usize = 1024 * 1024;
+const FALLBACK_CACHE_TTL: Duration = Duration::from_secs(30 * 60);
+const FALLBACK_CACHE_MAX_ENTRIES: usize = 1024;
 
 #[derive(serde::Deserialize, schemars::JsonSchema)]
 pub struct Params {
@@ -44,6 +52,77 @@ pub struct Server {
     fetcher: Arc<Fetcher>,
     auth: Arc<ResolverAuth>,
     credits: Arc<ResolverCreditsClient>,
+    fallback_cache: Arc<FetchFallbackCache>,
+}
+
+#[derive(Debug)]
+pub struct FetchFallbackCache {
+    entries: Mutex<HashMap<String, FallbackCacheEntry>>,
+    ttl: Duration,
+    max_entries: usize,
+}
+
+#[derive(Debug, Clone)]
+struct FallbackCacheEntry {
+    inserted_at: Instant,
+    reason: &'static str,
+}
+
+impl Default for FetchFallbackCache {
+    fn default() -> Self {
+        Self::new(FALLBACK_CACHE_TTL, FALLBACK_CACHE_MAX_ENTRIES)
+    }
+}
+
+impl FetchFallbackCache {
+    pub fn new(ttl: Duration, max_entries: usize) -> Self {
+        Self {
+            entries: Mutex::new(HashMap::new()),
+            ttl,
+            max_entries,
+        }
+    }
+
+    fn lookup(&self, key: &str) -> Option<&'static str> {
+        let now = Instant::now();
+        let mut entries = self.entries.lock().ok()?;
+        self.prune_locked(&mut entries, now);
+        entries.get(key).map(|entry| entry.reason)
+    }
+
+    fn flag(&self, key: String, reason: &'static str) {
+        let Ok(mut entries) = self.entries.lock() else {
+            return;
+        };
+        let now = Instant::now();
+        self.prune_locked(&mut entries, now);
+        entries.insert(
+            key,
+            FallbackCacheEntry {
+                inserted_at: now,
+                reason,
+            },
+        );
+        self.prune_locked(&mut entries, now);
+    }
+
+    fn prune_locked(&self, entries: &mut HashMap<String, FallbackCacheEntry>, now: Instant) {
+        entries.retain(|_, entry| now.duration_since(entry.inserted_at) <= self.ttl);
+        if self.max_entries == 0 {
+            entries.clear();
+            return;
+        }
+        while entries.len() > self.max_entries {
+            let Some(oldest_key) = entries
+                .iter()
+                .min_by_key(|(_, entry)| entry.inserted_at)
+                .map(|(key, _)| key.clone())
+            else {
+                break;
+            };
+            entries.remove(&oldest_key);
+        }
+    }
 }
 
 impl Server {
@@ -51,11 +130,13 @@ impl Server {
         fetcher: Arc<Fetcher>,
         auth: Arc<ResolverAuth>,
         credits: Arc<ResolverCreditsClient>,
+        fallback_cache: Arc<FetchFallbackCache>,
     ) -> Self {
         Self {
             fetcher,
             auth,
             credits,
+            fallback_cache,
         }
     }
 }
@@ -64,7 +145,7 @@ impl Server {
 impl Server {
     #[tool(
         name = "fetch_source",
-        description = "Fetch the exact source URL supplied by the user using the fast SmartMode proxy path. Use this whenever the prompt contains a source URL, `source: <url>`, `only take this source`, or says the URL is the source of truth. Do not perform web search or substitute another article.",
+        description = "Fetch the exact source URL supplied by the user using adaptive resolver routing. Use this whenever the prompt contains a source URL, `source: <url>`, `only take this source`, or says the URL is the source of truth. Do not perform web search or substitute another article.",
         annotations(
             title = "Fetch Source",
             read_only_hint = true,
@@ -86,6 +167,7 @@ impl Server {
             Err(result) => return Ok(result),
         };
 
+        // Keep every fetch path, including cached unblock fallback, behind auth and credit debit.
         let started = Instant::now();
         eprintln!("mcp fetch_source start url={url}");
         match self
@@ -116,21 +198,57 @@ impl Server {
             }
         }
 
-        let data = self
-            .fetcher
-            .get_fast_data_with_receipt_with_auth(&url, Some(&auth_context))
-            .await
-            .map_err(|e| {
-                eprintln!(
-                    "mcp fetch_source error elapsed_ms={} error={e}",
-                    started.elapsed().as_millis()
-                );
-                ErrorData::internal_error(e.to_string(), None)
-            })?;
+        let cache_key = normalize_fallback_url_key(&url);
+        let fallback_reason = self.fallback_cache.lookup(&cache_key);
+        let data = if let Some(reason) = fallback_reason {
+            eprintln!("mcp fetch_source fallback mode=unblock reason={reason} url={url}");
+            self.fetcher
+                .get_unblock_data_with_receipt_with_auth(&url, Some(&auth_context))
+                .await
+                .map_err(|e| {
+                    eprintln!(
+                        "mcp fetch_source unblock error elapsed_ms={} error={e}",
+                        started.elapsed().as_millis()
+                    );
+                    ErrorData::internal_error(e.to_string(), None)
+                })?
+        } else {
+            match self
+                .fetcher
+                .get_fast_data_with_receipt_with_auth(&url, Some(&auth_context))
+                .await
+            {
+                Ok(data) => {
+                    analyze_fetch_data_in_background(
+                        self.fallback_cache.clone(),
+                        cache_key,
+                        data.data.clone(),
+                    );
+                    data
+                }
+                Err(e) => {
+                    analyze_fetch_error_in_background(
+                        self.fallback_cache.clone(),
+                        cache_key,
+                        e.to_string(),
+                    );
+                    eprintln!(
+                        "mcp fetch_source fast error elapsed_ms={} error={e}",
+                        started.elapsed().as_millis()
+                    );
+                    return Err(ErrorData::internal_error(e.to_string(), None));
+                }
+            }
+        };
 
         let text = render_fetch_result(&data);
         eprintln!(
-            "mcp fetch_source ok elapsed_ms={} response_bytes={}",
+            "mcp fetch_source ok mode={} elapsed_ms={} response_bytes={}",
+            if fallback_reason.is_some() {
+                "unblock"
+            } else {
+                "fast"
+            },
             started.elapsed().as_millis(),
             text.len()
         );
@@ -593,21 +711,148 @@ fn extracted_content(data: &Value) -> Option<&str> {
         .find_map(|item| item.get("content").and_then(Value::as_str))
 }
 
+fn analyze_fetch_data_in_background(cache: Arc<FetchFallbackCache>, key: String, data: Value) {
+    tokio::spawn(async move {
+        if let Some(reason) = fallback_reason_for_fetch_data(&data) {
+            eprintln!("mcp fetch_source fallback flag reason={reason} key={key}");
+            cache.flag(key, reason);
+        }
+    });
+}
+
+fn analyze_fetch_error_in_background(cache: Arc<FetchFallbackCache>, key: String, error: String) {
+    tokio::spawn(async move {
+        if let Some(reason) = fallback_reason_for_text(&error) {
+            eprintln!("mcp fetch_source fallback flag reason={reason} key={key}");
+            cache.flag(key, reason);
+        }
+    });
+}
+
+fn fallback_reason_for_fetch_data(data: &Value) -> Option<&'static str> {
+    if let Some(content) = extracted_content(data) {
+        return fallback_reason_for_text(content);
+    }
+    fallback_reason_for_text(&data.to_string())
+}
+
+fn fallback_reason_for_text(text: &str) -> Option<&'static str> {
+    let normalized = normalize_detector_text(text);
+    if contains_any(
+        &normalized,
+        &[
+            "enable javascript",
+            "requires javascript",
+            "require javascript",
+            "javascript is disabled",
+            "javascript disabled",
+            "please enable js",
+            "turn on javascript",
+            "you need javascript",
+            "browser is required",
+        ],
+    ) {
+        return Some("javascript_required");
+    }
+
+    if contains_any(
+        &normalized,
+        &[
+            "blocked by robots",
+            "disallowed by robots",
+            "robots.txt",
+            "robots policy",
+            "respect robots",
+        ],
+    ) {
+        return Some("robots_blocked");
+    }
+
+    if contains_any(
+        &normalized,
+        &[
+            "verify you are human",
+            "verify that you are human",
+            "confirm you are human",
+            "prove you are human",
+            "are you a human",
+            "human verification",
+            "not a robot",
+            "are not a robot",
+            "verify you are not a robot",
+            "complete the security check",
+            "security check to access",
+            "captcha",
+        ],
+    ) {
+        return Some("human_verification");
+    }
+
+    if looks_like_browser_check(&normalized) {
+        return Some("browser_check");
+    }
+
+    None
+}
+
+fn looks_like_browser_check(normalized: &str) -> bool {
+    contains_any(
+        normalized,
+        &[
+            "checking your browser",
+            "checking if the site connection is secure",
+            "just a moment...",
+        ],
+    ) || (normalized.contains("cloudflare")
+        && contains_any(
+            normalized,
+            &["ray id", "attention required", "challenge", "turnstile"],
+        ))
+}
+
+fn contains_any(value: &str, needles: &[&str]) -> bool {
+    needles.iter().any(|needle| value.contains(needle))
+}
+
+fn normalize_detector_text(text: &str) -> String {
+    text.to_ascii_lowercase()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn normalize_fallback_url_key(url: &str) -> String {
+    let trimmed = url.trim();
+    if let Ok(mut parsed) = reqwest::Url::parse(trimmed) {
+        parsed.set_fragment(None);
+        if parsed.path() == "/" && parsed.query().is_none() {
+            let mut key = parsed.to_string();
+            key.truncate(key.trim_end_matches('/').len());
+            return key;
+        }
+        return parsed.to_string();
+    }
+
+    trimmed.trim_end_matches('/').to_ascii_lowercase()
+}
+
 #[tool_handler(
     name = "livygensyn-source-fetcher",
     version = "0.1.0",
-    instructions = "This server only fetches user-provided source URLs through the fast SmartMode proxy path. If a user prompt includes a URL or phrases like `source:`, `only take this source`, or `source of truth`, call `fetch_source` with that exact URL before answering. Do not search the web, do not use rumors or alternate sources, and do not replace the URL with a query."
+    instructions = "This server only fetches user-provided source URLs through adaptive resolver routing. If a user prompt includes a URL or phrases like `source:`, `only take this source`, or `source of truth`, call `fetch_source` with that exact URL before answering. Do not search the web, do not use rumors or alternate sources, and do not replace the URL with a query."
 )]
 impl ServerHandler for Server {}
 
 #[cfg(test)]
 mod tests {
     use super::{
-        FETCH_SOURCE_SCOPES, Server, mcp_http_oauth_challenge_response, oauth_challenge_result,
+        FETCH_SOURCE_SCOPES, FallbackCacheEntry, FetchFallbackCache, Server,
+        mcp_http_oauth_challenge_response, oauth_challenge_result,
     };
     use crate::auth::ResolverAuth;
     use axum::{body::to_bytes, http::header};
     use serde_json::json;
+    use std::time::{Duration, Instant};
 
     #[test]
     fn fetch_source_tool_advertises_oauth_metadata() {
@@ -780,6 +1025,119 @@ mod tests {
         assert_eq!(
             message["result"]["tools"][0]["_meta"]["openai/toolInvocation/invoked"],
             "Source fetched"
+        );
+    }
+
+    #[test]
+    fn fallback_detector_flags_javascript_robots_and_human_checks() {
+        assert_eq!(
+            super::fallback_reason_for_text("Please enable JavaScript to continue."),
+            Some("javascript_required")
+        );
+        assert_eq!(
+            super::fallback_reason_for_text("Access disallowed by robots.txt policy."),
+            Some("robots_blocked")
+        );
+        assert_eq!(
+            super::fallback_reason_for_text("Verify you are human before continuing."),
+            Some("human_verification")
+        );
+        assert_eq!(
+            super::fallback_reason_for_text("Just a moment... Checking your browser."),
+            Some("browser_check")
+        );
+    }
+
+    #[test]
+    fn fallback_detector_ignores_normal_content() {
+        assert_eq!(
+            super::fallback_reason_for_text(
+                "Robots are mentioned in this article, but the source content is available."
+            ),
+            None
+        );
+        assert_eq!(
+            super::fallback_reason_for_fetch_data(&json!([{
+                "content": "This is normal article text with a status page and useful content."
+            }])),
+            None
+        );
+    }
+
+    #[test]
+    fn fallback_detector_reads_content_from_spider_payloads() {
+        assert_eq!(
+            super::fallback_reason_for_fetch_data(&json!([{
+                "content": "Javascript is disabled in your browser."
+            }])),
+            Some("javascript_required")
+        );
+    }
+
+    #[test]
+    fn fallback_cache_hits_expires_and_prunes_old_entries() {
+        let cache = FetchFallbackCache::new(Duration::from_secs(60), 10);
+        cache.flag("https://example.com/one".to_string(), "javascript_required");
+        assert_eq!(
+            cache.lookup("https://example.com/one"),
+            Some("javascript_required")
+        );
+
+        let capped = FetchFallbackCache::new(Duration::from_secs(60), 2);
+        let now = Instant::now();
+        capped.entries.lock().expect("cache lock").extend([
+            (
+                "https://example.com/oldest".to_string(),
+                FallbackCacheEntry {
+                    inserted_at: now - Duration::from_secs(3),
+                    reason: "javascript_required",
+                },
+            ),
+            (
+                "https://example.com/middle".to_string(),
+                FallbackCacheEntry {
+                    inserted_at: now - Duration::from_secs(2),
+                    reason: "robots_blocked",
+                },
+            ),
+            (
+                "https://example.com/newest".to_string(),
+                FallbackCacheEntry {
+                    inserted_at: now - Duration::from_secs(1),
+                    reason: "human_verification",
+                },
+            ),
+        ]);
+        assert_eq!(capped.lookup("https://example.com/oldest"), None);
+        assert_eq!(
+            capped.lookup("https://example.com/middle"),
+            Some("robots_blocked")
+        );
+        assert_eq!(
+            capped.lookup("https://example.com/newest"),
+            Some("human_verification")
+        );
+
+        let expiring = FetchFallbackCache::new(Duration::from_secs(1), 10);
+        expiring.entries.lock().expect("cache lock").insert(
+            "https://example.com/old".to_string(),
+            FallbackCacheEntry {
+                inserted_at: Instant::now() - Duration::from_secs(2),
+                reason: "browser_check",
+            },
+        );
+        assert_eq!(expiring.lookup("https://example.com/old"), None);
+    }
+
+    #[test]
+    fn fallback_url_key_drops_fragments_and_root_trailing_slash() {
+        assert_eq!(
+            super::normalize_fallback_url_key(" https://Example.com/#fragment "),
+            "https://example.com"
+        );
+        assert_eq!(
+            super::normalize_fallback_url_key("https://example.com/path/#fragment"),
+            "https://example.com/path/"
         );
     }
 }

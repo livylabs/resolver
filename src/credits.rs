@@ -1,6 +1,7 @@
 //! Livy user-credit debit client for OAuth-protected resolver requests.
 
 use crate::auth::ResolverAuthContext;
+use crate::errors::ResolverCreditsError;
 use livy_provenance_sdk::DEFAULT_LIVY_API_BASE_URL;
 use reqwest::{
     StatusCode,
@@ -10,7 +11,6 @@ use serde::Deserialize;
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::{
-    fmt,
     sync::atomic::{AtomicU64, Ordering},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -31,14 +31,6 @@ pub struct ResolverCreditDebitOutcome {
     pub enforced: bool,
     pub charged: bool,
     pub amount: i64,
-}
-
-#[derive(Debug)]
-pub enum ResolverCreditsError {
-    MissingAuth(&'static str),
-    InvalidHeader(String),
-    Http(reqwest::Error),
-    Backend { status: StatusCode, body: String },
 }
 
 impl ResolverCreditsClient {
@@ -190,37 +182,6 @@ struct ResolverCreditRequest<'a> {
     metadata: serde_json::Value,
 }
 
-impl ResolverCreditsError {
-    pub fn is_payment_required(&self) -> bool {
-        match self {
-            Self::Backend { status, body } => {
-                *status == StatusCode::PAYMENT_REQUIRED
-                    || backend_error_code(body).as_deref() == Some("insufficient_user_credits")
-            }
-            _ => false,
-        }
-    }
-}
-
-impl fmt::Display for ResolverCreditsError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::MissingAuth(claim) => write!(f, "OAuth context is missing Livy {claim}"),
-            Self::InvalidHeader(err) => write!(f, "credit request header is invalid: {err}"),
-            Self::Http(err) => write!(f, "credit request failed: {err}"),
-            Self::Backend { status, body } => {
-                write!(
-                    f,
-                    "credit request returned {status}: {}",
-                    compact_body(body)
-                )
-            }
-        }
-    }
-}
-
-impl std::error::Error for ResolverCreditsError {}
-
 fn resolver_request_idempotency_key(
     request: &ResolverCreditRequest<'_>,
     auth_context: &ResolverAuthContext,
@@ -258,17 +219,6 @@ fn resolver_request_idempotency_key(
 
 fn object_or_empty(value: serde_json::Value) -> serde_json::Map<String, serde_json::Value> {
     value.as_object().cloned().unwrap_or_default()
-}
-
-fn backend_error_code(body: &str) -> Option<String> {
-    serde_json::from_str::<serde_json::Value>(body)
-        .ok()
-        .and_then(|value| {
-            value
-                .get("code")
-                .and_then(serde_json::Value::as_str)
-                .map(str::to_string)
-        })
 }
 
 fn key_segment(value: &str) -> String {
@@ -324,14 +274,6 @@ fn trim_trailing_slash(value: &str) -> String {
 fn sha256_hex(bytes: &[u8]) -> String {
     let digest = Sha256::digest(bytes);
     hex::encode(digest)
-}
-
-fn compact_body(body: &str) -> String {
-    let body = body.trim();
-    if body.len() <= 512 {
-        return body.to_string();
-    }
-    format!("{}...", &body[..512])
 }
 
 #[cfg(test)]
