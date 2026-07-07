@@ -1,6 +1,7 @@
 //! MCP tool wrapper for exact source fetching.
 
 use crate::auth::{ResolverAuth, ResolverAuthContext, ResolverAuthError};
+use crate::credits::ResolverCreditsClient;
 use crate::fetch::Fetcher;
 use crate::types::FetchWithReceipt;
 use axum::{
@@ -33,16 +34,29 @@ pub struct Params {
         description = "The exact source URL from the user prompt. Do not replace it with a search query or another URL."
     )]
     pub url: String,
+    #[schemars(
+        description = "Optional stable idempotency key for this fetch_source call. Reuse the same key only when retrying the same MCP call."
+    )]
+    pub idempotency_key: Option<String>,
 }
 
 pub struct Server {
     fetcher: Arc<Fetcher>,
     auth: Arc<ResolverAuth>,
+    credits: Arc<ResolverCreditsClient>,
 }
 
 impl Server {
-    pub fn new(fetcher: Arc<Fetcher>, auth: Arc<ResolverAuth>) -> Self {
-        Self { fetcher, auth }
+    pub fn new(
+        fetcher: Arc<Fetcher>,
+        auth: Arc<ResolverAuth>,
+        credits: Arc<ResolverCreditsClient>,
+    ) -> Self {
+        Self {
+            fetcher,
+            auth,
+            credits,
+        }
     }
 }
 
@@ -62,7 +76,10 @@ impl Server {
     async fn fetch_source(
         &self,
         Extension(parts): Extension<Parts>,
-        Parameters(Params { url }): Parameters<Params>,
+        Parameters(Params {
+            url,
+            idempotency_key,
+        }): Parameters<Params>,
     ) -> Result<CallToolResult, ErrorData> {
         let auth_context = match self.require_oauth(&parts).await? {
             Ok(context) => context,
@@ -71,6 +88,33 @@ impl Server {
 
         let started = Instant::now();
         eprintln!("mcp fetch_source start url={url}");
+        match self
+            .credits
+            .debit_fetch_source(&auth_context, &url, idempotency_key.as_deref())
+            .await
+        {
+            Ok(Some(outcome)) => {
+                eprintln!(
+                    "mcp fetch_source credits charged={} amount={} mode={} enforced={}",
+                    outcome.charged, outcome.amount, outcome.mode, outcome.enforced
+                );
+            }
+            Ok(None) => {
+                eprintln!("mcp fetch_source credits skipped");
+            }
+            Err(err) => {
+                eprintln!(
+                    "mcp fetch_source credits error elapsed_ms={} error={err}",
+                    started.elapsed().as_millis()
+                );
+                let message = if err.is_payment_required() {
+                    format!("Livy payment required: {err}")
+                } else {
+                    format!("Livy credit authorization failed: {err}")
+                };
+                return Ok(CallToolResult::error(vec![Content::text(message)]));
+            }
+        }
 
         let data = self
             .fetcher

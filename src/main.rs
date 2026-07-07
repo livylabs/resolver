@@ -2,6 +2,7 @@
 
 mod api;
 mod auth;
+mod credits;
 mod errors;
 mod fetch;
 mod mcp;
@@ -13,7 +14,7 @@ use api::{
     screenshot_post, search_post, snapshot_source,
 };
 use axum::{
-    Router, middleware,
+    Extension, Router, middleware,
     routing::{get, post},
 };
 use std::sync::Arc;
@@ -28,13 +29,21 @@ async fn main() -> Result<()> {
     let fetcher = Arc::new(fetch::Fetcher::new());
     let mcp_fetcher = fetcher.clone();
     let resolver_auth = Arc::new(auth::ResolverAuth::from_env());
+    let resolver_credits = Arc::new(credits::ResolverCreditsClient::from_env());
     let mcp_auth = resolver_auth.clone();
+    let mcp_credits = resolver_credits.clone();
     let metadata_auth = resolver_auth.clone();
     let mcp_metadata_auth = resolver_auth.clone();
     let mcp_challenge_auth = resolver_auth.clone();
 
     let mcp_service = StreamableHttpService::new(
-        move || Ok(mcp::Server::new(mcp_fetcher.clone(), mcp_auth.clone())),
+        move || {
+            Ok(mcp::Server::new(
+                mcp_fetcher.clone(),
+                mcp_auth.clone(),
+                mcp_credits.clone(),
+            ))
+        },
         LocalSessionManager::default().into(),
         mcp_config(),
     );
@@ -51,6 +60,7 @@ async fn main() -> Result<()> {
         .route("/fetchunblock", post(fetch_unblock))
         .route("/receipt/{id}", get(get_receipt))
         .route("/recipt/{id}", get(get_receipt))
+        .layer(Extension(resolver_credits.clone()))
         .route_layer(middleware::from_fn_with_state(
             resolver_auth.clone(),
             auth::require_product_oauth,

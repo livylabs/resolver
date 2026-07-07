@@ -26,6 +26,10 @@ pub enum FetchError {
     NotFound(String),
     #[error("Bad request")]
     BadRequest(String),
+    #[error("Payment required")]
+    PaymentRequired(String),
+    #[error("Credit authorization failed")]
+    Credits(String),
     #[error("Snapshot failed")]
     Snapshot(#[from] SnapshotError),
 }
@@ -52,12 +56,26 @@ impl IntoResponse for FetchError {
             ),
             FetchError::NotFound(e) => (StatusCode::NOT_FOUND, e),
             FetchError::BadRequest(e) => (StatusCode::BAD_REQUEST, e),
+            FetchError::PaymentRequired(e) => (
+                StatusCode::PAYMENT_REQUIRED,
+                format!("Payment required {}", e),
+            ),
+            FetchError::Credits(e) => (
+                StatusCode::BAD_GATEWAY,
+                format!("Credit authorization failed {}", e),
+            ),
             FetchError::Snapshot(e) => (StatusCode::BAD_REQUEST, format!("Snapshot failed {}", e)),
         };
 
-        let body = Json(json!({
-            "error" : message
-        }));
+        let body = match status {
+            StatusCode::PAYMENT_REQUIRED => Json(json!({
+                "code": "payment_required",
+                "error": message
+            })),
+            _ => Json(json!({
+                "error" : message
+            })),
+        };
         (status, body).into_response()
     }
 }

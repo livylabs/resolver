@@ -309,7 +309,11 @@ async fn require_oauth(
         )
         .await
     {
-        Ok(_) => next.run(request).await,
+        Ok(context) => {
+            let mut request = request;
+            request.extensions_mut().insert(context);
+            next.run(request).await
+        }
         Err(ResolverAuthError::Unauthorized { error, message }) => {
             unauthorized(&auth, required_scopes, error, message)
         }
