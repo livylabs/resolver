@@ -1,5 +1,6 @@
 //! Livy OAuth bearer-token enforcement for product routes and MCP tool calls.
 
+use crate::errors::ResolverAuthError;
 use axum::{
     Json,
     body::Body,
@@ -249,29 +250,6 @@ impl ResolverAuth {
             ],
             resource_metadata_url:
                 "https://resolver.api.livylabs.xyz/.well-known/oauth-protected-resource".to_string(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ResolverAuthError {
-    Unauthorized {
-        error: &'static str,
-        message: &'static str,
-    },
-    Forbidden {
-        error: &'static str,
-        message: &'static str,
-    },
-    ServiceUnavailable(String),
-}
-
-impl ResolverAuthError {
-    pub fn challenge_parts(&self) -> Option<(&'static str, &'static str)> {
-        match self {
-            ResolverAuthError::Unauthorized { error, message }
-            | ResolverAuthError::Forbidden { error, message } => Some((error, message)),
-            ResolverAuthError::ServiceUnavailable(_) => None,
         }
     }
 }

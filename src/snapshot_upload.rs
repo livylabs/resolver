@@ -1,6 +1,6 @@
+use crate::errors::SnapshotError;
 use serde::Serialize;
 use serde_json::Value;
-use std::fmt;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone, Serialize)]
@@ -10,27 +10,6 @@ pub struct SnapshotPayload {
     pub html: String,
     pub screenshot_base64: String,
 }
-
-#[derive(Debug)]
-pub enum SnapshotError {
-    MissingHtml,
-    MissingScreenshot,
-}
-
-impl fmt::Display for SnapshotError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            SnapshotError::MissingHtml => {
-                write!(f, "Spider snapshot response did not include raw HTML")
-            }
-            SnapshotError::MissingScreenshot => {
-                write!(f, "Spider snapshot response did not include a screenshot")
-            }
-        }
-    }
-}
-
-impl std::error::Error for SnapshotError {}
 
 impl SnapshotPayload {
     pub fn from_spider_response(source_url: &str, response: Value) -> Result<Self, SnapshotError> {

@@ -171,6 +171,31 @@ impl Fetcher {
         })
     }
 
+    pub async fn get_unblock_data_with_receipt_with_auth(
+        &self,
+        source: &str,
+        auth_context: Option<&ResolverAuthContext>,
+    ) -> Result<FetchWithReceipt, FetchError> {
+        let mut payload = ProductRequest::fast(source);
+        payload.mode = ProductMode::Unblock;
+        payload.receipt = Some(true);
+        let response = self
+            .product_fetch_with_auth(payload, ProductRoute::Unblock, auth_context)
+            .await?;
+        let data = response.data;
+        let receipt = response
+            .receipt
+            .ok_or_else(|| FetchError::Http("receipt was not created".to_string()))?;
+
+        Ok(FetchWithReceipt {
+            receipt_id: receipt.id.clone(),
+            receipt: receipt.clone(),
+            data,
+            provenance: response.provenance,
+            provenance_error: response.provenance_error,
+        })
+    }
+
     pub async fn snapshot_with_receipt(&self, source: &str) -> Result<SnapshotPayload, FetchError> {
         let formats = HashSet::from([ReturnFormat::Raw, ReturnFormat::Screenshot]);
         let params = RequestParams {

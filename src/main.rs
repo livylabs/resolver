@@ -30,6 +30,7 @@ async fn main() -> Result<()> {
     let mcp_fetcher = fetcher.clone();
     let resolver_auth = Arc::new(auth::ResolverAuth::from_env());
     let resolver_credits = Arc::new(credits::ResolverCreditsClient::from_env());
+    let mcp_fallback_cache = Arc::new(mcp::FetchFallbackCache::default());
     let mcp_auth = resolver_auth.clone();
     let mcp_credits = resolver_credits.clone();
     let metadata_auth = resolver_auth.clone();
@@ -42,6 +43,7 @@ async fn main() -> Result<()> {
                 mcp_fetcher.clone(),
                 mcp_auth.clone(),
                 mcp_credits.clone(),
+                mcp_fallback_cache.clone(),
             ))
         },
         LocalSessionManager::default().into(),
