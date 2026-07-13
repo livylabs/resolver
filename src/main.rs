@@ -2,11 +2,13 @@
 
 mod api;
 mod auth;
+mod config;
 mod credits;
 mod errors;
 mod fetch;
 mod mcp;
 mod provenance;
+mod security;
 mod snapshot_upload;
 mod types;
 use api::{
@@ -14,7 +16,9 @@ use api::{
     screenshot_post, search_post, snapshot_source,
 };
 use axum::{
-    Extension, Router, middleware,
+    Extension, Router,
+    extract::DefaultBodyLimit,
+    middleware,
     routing::{get, post},
 };
 use std::sync::Arc;
@@ -26,6 +30,8 @@ use rmcp::transport::streamable_http_server::{
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    dotenvy::dotenv().ok();
+    let security_config = config::SecurityConfig::from_env().map_err(FetchError::Http)?;
     let fetcher = Arc::new(fetch::Fetcher::new());
     let mcp_fetcher = fetcher.clone();
     let resolver_auth = Arc::new(auth::ResolverAuth::from_env());
@@ -63,6 +69,11 @@ async fn main() -> Result<()> {
         .route("/receipt/{id}", get(get_receipt))
         .route("/recipt/{id}", get(get_receipt))
         .layer(Extension(resolver_credits.clone()))
+        .layer(DefaultBodyLimit::max(security_config.product_body_bytes))
+        .layer(middleware::from_fn_with_state(
+            security_config.clone(),
+            security::product_timeout,
+        ))
         .route_layer(middleware::from_fn_with_state(
             resolver_auth.clone(),
             auth::require_product_oauth,
@@ -95,6 +106,10 @@ async fn main() -> Result<()> {
         )
         .merge(product_routes)
         .merge(mcp_routes)
+        .layer(middleware::from_fn_with_state(
+            security_config,
+            security::request_security,
+        ))
         .with_state(fetcher);
 
     let port = std::env::var("PORT")

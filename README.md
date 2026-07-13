@@ -15,13 +15,16 @@ Default mode is SmartMode. Override via `mode` when you need specific cost/speed
 ## Setup
 
 ```
-SPIDER_API_KEY=your-spider-api-key
+LIVY_RESOLVER_KEY=your-resolver-key
 cargo run
 ```
 
-`LIVY_KEY` is still accepted as a legacy alias for `SPIDER_API_KEY`.
+`SPIDER_API_KEY`, `SPIDER_KEY`, and `LIVY_KEY` remain accepted as legacy
+aliases for `LIVY_RESOLVER_KEY`.
 The service listens on `http://localhost:3001` unless `PORT` or
 `RESOLVER_PORT` is set.
+
+Copy `.env.example` to `.env` for the full local configuration template.
 
 Product routes and MCP requests require a Livy OAuth bearer token by default.
 Unauthenticated MCP requests, including `initialize` and `tools/list`, return
@@ -54,7 +57,7 @@ target.
 Enable provenance with:
 
 ```dotenv
-SPIDER_API_KEY=your-spider-api-key
+LIVY_RESOLVER_KEY=your-resolver-key
 LIVY_PROVENANCE_ENABLED=true
 LIVY_BACKEND_BASE_URL=https://api.livylabs.xyz
 LIVY_INTEGRATION_ID=delphi
@@ -141,6 +144,38 @@ Request fields: `source`, `query`/`q`, `mode` (`auto|fast|browser|unblock|raw|cr
 | GET | `/receipt/{id}` | Read receipt |
 
 Prefer `/fetch` with `mode` over the compat routes.
+
+## API security
+
+Product requests are limited to 64 KiB and 65 seconds by default. Override
+these deployment safety limits with:
+
+```dotenv
+LIVY_RESOLVER_MAX_PRODUCT_BODY_BYTES=65536
+LIVY_RESOLVER_PRODUCT_TIMEOUT_SECS=65
+LIVY_RESOLVER_HSTS_ENABLED=false
+```
+
+Enable HSTS only when the public endpoint is served through HTTPS. The API
+accepts absolute HTTP and HTTPS source URLs, including localhost and private
+addresses, because internal-source resolution is supported. Deploy Spider and
+the resolver behind egress controls that block cloud metadata services and
+other destinations that must not be reachable.
+
+Errors retain the existing top-level `error` string and add stable `code` and
+`request_id` fields. Responses include `x-request-id`; logs are JSON objects
+and identify source URLs only by SHA-256. Raw bearer tokens, cookies, URLs,
+query strings, and request bodies must not be logged.
+
+Rate limiting is intentionally gateway-managed so limits remain consistent
+across replicas. Apply burst limits by client IP or token hash at the ingress;
+credit debits continue to provide tenant-level economic enforcement.
+
+For operations, collect stdout with OpenTelemetry Collector, Vector, or Fluent
+Bit. Prometheus and Grafana are suitable for request and gateway metrics, and
+Sentry can aggregate Rust failures. Alert on 5xx rates, upstream latency and
+timeouts, OAuth introspection failures, credit-service failures, validation
+rejections, and gateway 429 responses. Do not attach raw source URLs as labels.
 
 ## MCP
 

@@ -322,7 +322,7 @@ fn bearer_token_from_header(value: &HeaderValue) -> Option<&str> {
     let (scheme, token) = value.split_once(' ')?;
     if scheme.eq_ignore_ascii_case("bearer") {
         let token = token.trim();
-        if !token.is_empty() {
+        if !token.is_empty() && token.len() <= 16 * 1024 {
             return Some(token);
         }
     }
@@ -460,7 +460,15 @@ fn auth_error_response(
     error: &'static str,
     message: &'static str,
 ) -> Response {
-    let mut response = (status, Json(json!({ "error": message }))).into_response();
+    let mut response = (
+        status,
+        Json(json!({
+            "error": message,
+            "code": error,
+            "request_id": crate::security::current_request_id(),
+        })),
+    )
+        .into_response();
     if let Ok(value) = HeaderValue::from_str(&auth.challenge(required_scopes, error, message)) {
         response
             .headers_mut()
@@ -469,10 +477,14 @@ fn auth_error_response(
     response
 }
 
-fn auth_service_unavailable(message: String) -> Response {
+fn auth_service_unavailable(_message: String) -> Response {
     (
         StatusCode::SERVICE_UNAVAILABLE,
-        Json(json!({ "error": message })),
+        Json(json!({
+            "error": "OAuth validation service is unavailable",
+            "code": "auth_service_unavailable",
+            "request_id": crate::security::current_request_id(),
+        })),
     )
         .into_response()
 }

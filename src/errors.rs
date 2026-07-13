@@ -111,47 +111,65 @@ pub enum SnapshotError {
 
 impl IntoResponse for FetchError {
     fn into_response(self) -> Response {
-        let (status, message) = match self {
-            FetchError::UnableFetch(e) => (StatusCode::CREATED, format!("Fetch failed {} ", e)),
-            FetchError::UnableToSerialize(e) => (
-                StatusCode::BAD_REQUEST,
-                format!("Data is not serializable {}", e),
+        let (status, code, message) = match self {
+            FetchError::UnableFetch(_) | FetchError::Upstream(_) => (
+                StatusCode::BAD_GATEWAY,
+                "upstream_fetch_failed",
+                "Upstream fetch failed".to_string(),
             ),
-            FetchError::Http(e) => (
+            FetchError::UnableToSerialize(_) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Http failed {}", e),
+                "response_serialization_failed",
+                "Internal response serialization failed".to_string(),
             ),
-            FetchError::Upstream(e) => (
-                StatusCode::BAD_GATEWAY,
-                format!("Upstream fetch failed {}", e),
+            FetchError::Http(_) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal_error",
+                "Internal server error".to_string(),
             ),
-            FetchError::Timeout(e) => (
+            FetchError::Timeout(_) => (
                 StatusCode::GATEWAY_TIMEOUT,
-                format!("Fetch timed out {}", e),
+                "upstream_timeout",
+                "Upstream request timed out".to_string(),
             ),
-            FetchError::NotFound(e) => (StatusCode::NOT_FOUND, e),
-            FetchError::BadRequest(e) => (StatusCode::BAD_REQUEST, e),
-            FetchError::PaymentRequired(e) => (
+            FetchError::NotFound(_) => (
+                StatusCode::NOT_FOUND,
+                "not_found",
+                "Receipt not found".to_string(),
+            ),
+            FetchError::BadRequest(message) => {
+                (StatusCode::BAD_REQUEST, "invalid_request", message)
+            }
+            FetchError::PaymentRequired(_) => (
                 StatusCode::PAYMENT_REQUIRED,
-                format!("Payment required {}", e),
+                "payment_required",
+                "Insufficient credits".to_string(),
             ),
-            FetchError::Credits(e) => (
+            FetchError::Credits(_) => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "credit_service_unavailable",
+                "Credit authorization service is unavailable".to_string(),
+            ),
+            FetchError::Snapshot(_) => (
                 StatusCode::BAD_GATEWAY,
-                format!("Credit authorization failed {}", e),
+                "invalid_upstream_snapshot",
+                "Upstream snapshot response is invalid".to_string(),
             ),
-            FetchError::Snapshot(e) => (StatusCode::BAD_REQUEST, format!("Snapshot failed {}", e)),
         };
 
-        let body = match status {
-            StatusCode::PAYMENT_REQUIRED => Json(json!({
-                "code": "payment_required",
-                "error": message
-            })),
-            _ => Json(json!({
-                "error" : message
-            })),
-        };
-        (status, body).into_response()
+        let body = Json(json!({
+            "error": message,
+            "code": code,
+            "request_id": crate::security::current_request_id(),
+        }));
+        let mut response = (status, body).into_response();
+        if status == StatusCode::SERVICE_UNAVAILABLE {
+            response.headers_mut().insert(
+                axum::http::header::RETRY_AFTER,
+                axum::http::HeaderValue::from_static("1"),
+            );
+        }
+        response
     }
 }
 
@@ -172,4 +190,46 @@ fn compact_body(body: &str) -> String {
         return body.to_string();
     }
     format!("{}...", &body[..512])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::to_bytes;
+
+    #[tokio::test]
+    async fn upstream_errors_are_bad_gateway_and_sanitized() {
+        let response = FetchError::Upstream("secret backend detail".into()).into_response();
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("error body");
+        let value: serde_json::Value = serde_json::from_slice(&body).expect("json error");
+        assert_eq!(value["code"], "upstream_fetch_failed");
+        assert_eq!(value["error"], "Upstream fetch failed");
+        assert!(!String::from_utf8_lossy(&body).contains("secret backend detail"));
+    }
+
+    #[tokio::test]
+    async fn credit_errors_are_service_unavailable() {
+        let response = FetchError::Credits("backend response".into()).into_response();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            response.headers().get(axum::http::header::RETRY_AFTER),
+            Some(&axum::http::HeaderValue::from_static("1"))
+        );
+    }
+
+    #[tokio::test]
+    async fn validation_errors_remain_actionable() {
+        let response =
+            FetchError::BadRequest("`limit` must be between 1 and 100".into()).into_response();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("error body");
+        let value: serde_json::Value = serde_json::from_slice(&body).expect("json error");
+        assert_eq!(value["code"], "invalid_request");
+        assert_eq!(value["error"], "`limit` must be between 1 and 100");
+    }
 }
