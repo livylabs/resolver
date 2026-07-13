@@ -403,10 +403,14 @@ impl ProvenanceClient {
         }
 
         eprintln!(
-            "provenance oauth passthrough tenant_id={} project_id={} integration_id={}",
-            auth_context.tenant_id.as_deref().unwrap_or("unknown"),
-            auth_context.project_id.as_deref().unwrap_or("unknown"),
-            self.config.integration_id
+            "{}",
+            serde_json::json!({
+                "event": "provenance_oauth_passthrough",
+                "request_id": crate::security::current_request_id(),
+                "tenant_id": auth_context.tenant_id.as_deref(),
+                "project_id": auth_context.project_id.as_deref(),
+                "integration_id": self.config.integration_id.as_str(),
+            })
         );
 
         let response = self

@@ -4,6 +4,14 @@ use crate::provenance::ProvenanceResult;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
+use url::Url;
+
+const MAX_URL_LEN: usize = 8_192;
+const MAX_QUERY_LEN: usize = 2_048;
+const MAX_LIST_ENTRIES: usize = 100;
+const MAX_STRING_LEN: usize = 2_048;
+const MAX_HEADERS: usize = 32;
+const MAX_HEADER_BYTES: usize = 8 * 1024;
 
 /// High-level route behavior exposed to API clients.
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -203,6 +211,75 @@ pub struct ProductRequest {
 }
 
 impl ProductRequest {
+    /// Validate route-specific and bounded input before charging or calling Spider.
+    pub fn validate_for(&self, route: ProductRoute) -> Result<(), crate::errors::FetchError> {
+        use crate::errors::FetchError;
+
+        if route == ProductRoute::Search {
+            validate_required_string("query", self.query.as_deref(), MAX_QUERY_LEN)?;
+        } else {
+            validate_source_url(self.require_source()?)?;
+        }
+
+        validate_range("limit", self.limit.map(u64::from), 1, 100)?;
+        validate_range("search_limit", self.search_limit.map(u64::from), 1, 100)?;
+        validate_range("depth", self.depth.map(u64::from), 0, 10)?;
+        validate_range("timeout_secs", self.timeout_secs, 1, 60)?;
+        validate_range(
+            "request_timeout_secs",
+            self.request_timeout_secs.map(u64::from),
+            1,
+            60,
+        )?;
+        validate_range("crawl_timeout_secs", self.crawl_timeout_secs, 1, 60)?;
+        validate_range("wait_ms", self.wait_ms, 0, 30_000)?;
+        validate_range("scroll", self.scroll.map(u64::from), 0, 100)?;
+
+        if let Some(formats) = &self.formats {
+            validate_collection_len("formats", formats.len(), 1, 8)?;
+        }
+        if let Some(FormatSelection::Many(formats)) = &self.format {
+            validate_collection_len("format", formats.len(), 1, 8)?;
+        }
+        if let Some(country) = &self.country_code
+            && (country.len() != 2 || !country.bytes().all(|byte| byte.is_ascii_alphabetic()))
+        {
+            return Err(FetchError::BadRequest(
+                "`country_code` must contain two ASCII letters".into(),
+            ));
+        }
+        validate_optional_string("locale", self.locale.as_deref(), 64)?;
+        validate_optional_string("user_agent", self.user_agent.as_deref(), 512)?;
+        validate_optional_string("cookies", self.cookies.as_deref(), MAX_HEADER_BYTES)?;
+        validate_optional_string("root_selector", self.root_selector.as_deref(), 1_024)?;
+        validate_optional_string("wait_selector", self.wait_selector.as_deref(), 1_024)?;
+        validate_string_list("whitelist", self.whitelist.as_deref())?;
+        validate_string_list("blacklist", self.blacklist.as_deref())?;
+        validate_string_list("external_domains", self.external_domains.as_deref())?;
+        validate_headers(self.headers.as_ref())?;
+        validate_selectors(self.selectors.as_ref())?;
+
+        if let Some(engine) = self.engine.as_deref()
+            && !matches!(
+                engine.to_ascii_lowercase().as_str(),
+                "google" | "brave" | "all"
+            )
+        {
+            return Err(FetchError::BadRequest(
+                "`engine` must be one of: google, brave, all".into(),
+            ));
+        }
+        if let Some(value) = self.max_credits_per_page
+            && (!value.is_finite() || value <= 0.0)
+        {
+            return Err(FetchError::BadRequest(
+                "`max_credits_per_page` must be finite and greater than zero".into(),
+            ));
+        }
+
+        Ok(())
+    }
+
     /// Legacy exact-source request used by older handlers.
     pub fn legacy(source: &str) -> Self {
         Self {
@@ -270,6 +347,208 @@ impl ProductRequest {
             .as_deref()
             .ok_or_else(|| crate::errors::FetchError::BadRequest("route requires `source`".into()))
     }
+}
+
+pub fn validate_source_url(source: &str) -> Result<(), crate::errors::FetchError> {
+    use crate::errors::FetchError;
+
+    if source.is_empty() || source.len() > MAX_URL_LEN || source.trim() != source {
+        return Err(FetchError::BadRequest(
+            "`source` must be a non-empty URL no longer than 8192 characters".into(),
+        ));
+    }
+    let parsed = Url::parse(source)
+        .map_err(|_| FetchError::BadRequest("`source` must be a valid absolute URL".into()))?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Err(FetchError::BadRequest(
+            "`source` must use the http or https scheme".into(),
+        ));
+    }
+    if parsed.host().is_none() {
+        return Err(FetchError::BadRequest(
+            "`source` must include a host".into(),
+        ));
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(FetchError::BadRequest(
+            "`source` must not contain embedded credentials".into(),
+        ));
+    }
+    Ok(())
+}
+
+pub fn validate_idempotency_key(value: Option<&str>) -> Result<(), crate::errors::FetchError> {
+    if let Some(value) = value {
+        let trimmed = value.trim();
+        if trimmed.is_empty()
+            || trimmed.len() > 128
+            || !trimmed.bytes().all(|byte| {
+                byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':')
+            })
+        {
+            return Err(crate::errors::FetchError::BadRequest(
+                "`idempotency_key` must be 1-128 safe ASCII characters".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+pub fn validate_receipt_id(value: &str) -> Result<(), crate::errors::FetchError> {
+    if value.is_empty()
+        || value.len() > 128
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        return Err(crate::errors::FetchError::BadRequest(
+            "invalid receipt id".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_required_string(
+    field: &str,
+    value: Option<&str>,
+    max: usize,
+) -> Result<(), crate::errors::FetchError> {
+    let value = value.ok_or_else(|| {
+        crate::errors::FetchError::BadRequest(format!("route requires `{field}`"))
+    })?;
+    if value.trim().is_empty() || value.len() > max {
+        return Err(crate::errors::FetchError::BadRequest(format!(
+            "`{field}` must be non-empty and no longer than {max} characters"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_optional_string(
+    field: &str,
+    value: Option<&str>,
+    max: usize,
+) -> Result<(), crate::errors::FetchError> {
+    if let Some(value) = value
+        && value.len() > max
+    {
+        return Err(crate::errors::FetchError::BadRequest(format!(
+            "`{field}` must be no longer than {max} characters"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_range(
+    field: &str,
+    value: Option<u64>,
+    min: u64,
+    max: u64,
+) -> Result<(), crate::errors::FetchError> {
+    if let Some(value) = value
+        && !(min..=max).contains(&value)
+    {
+        return Err(crate::errors::FetchError::BadRequest(format!(
+            "`{field}` must be between {min} and {max}"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_collection_len(
+    field: &str,
+    len: usize,
+    min: usize,
+    max: usize,
+) -> Result<(), crate::errors::FetchError> {
+    if !(min..=max).contains(&len) {
+        return Err(crate::errors::FetchError::BadRequest(format!(
+            "`{field}` must contain between {min} and {max} entries"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_string_list(
+    field: &str,
+    values: Option<&[String]>,
+) -> Result<(), crate::errors::FetchError> {
+    let Some(values) = values else { return Ok(()) };
+    validate_collection_len(field, values.len(), 0, MAX_LIST_ENTRIES)?;
+    if values.iter().any(|value| value.len() > MAX_STRING_LEN) {
+        return Err(crate::errors::FetchError::BadRequest(format!(
+            "`{field}` entries must be no longer than {MAX_STRING_LEN} characters"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_headers(
+    headers: Option<&HashMap<String, String>>,
+) -> Result<(), crate::errors::FetchError> {
+    let Some(headers) = headers else {
+        return Ok(());
+    };
+    validate_collection_len("headers", headers.len(), 0, MAX_HEADERS)?;
+    let mut total = 0usize;
+    for (name, value) in headers {
+        total = total.saturating_add(name.len()).saturating_add(value.len());
+        let parsed_name = name.parse::<axum::http::HeaderName>().map_err(|_| {
+            crate::errors::FetchError::BadRequest(format!("invalid request header name `{name}`"))
+        })?;
+        value.parse::<axum::http::HeaderValue>().map_err(|_| {
+            crate::errors::FetchError::BadRequest(format!(
+                "invalid value for request header `{name}`"
+            ))
+        })?;
+        if matches!(
+            parsed_name.as_str(),
+            "host"
+                | "connection"
+                | "content-length"
+                | "transfer-encoding"
+                | "proxy-authorization"
+                | "te"
+                | "trailer"
+                | "upgrade"
+        ) {
+            return Err(crate::errors::FetchError::BadRequest(format!(
+                "request header `{name}` is not allowed"
+            )));
+        }
+    }
+    if total > MAX_HEADER_BYTES {
+        return Err(crate::errors::FetchError::BadRequest(
+            "request headers exceed 8192 bytes".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_selectors(
+    selectors: Option<&HashMap<String, Vec<String>>>,
+) -> Result<(), crate::errors::FetchError> {
+    let Some(selectors) = selectors else {
+        return Ok(());
+    };
+    validate_collection_len("selectors", selectors.len(), 0, 32)?;
+    for (name, values) in selectors {
+        if name.is_empty() || name.len() > 128 {
+            return Err(crate::errors::FetchError::BadRequest(
+                "selector names must be 1-128 characters".into(),
+            ));
+        }
+        validate_collection_len("selector values", values.len(), 1, 32)?;
+        if values
+            .iter()
+            .any(|value| value.is_empty() || value.len() > 1_024)
+        {
+            return Err(crate::errors::FetchError::BadRequest(
+                "selectors must be 1-1024 characters".into(),
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Internal route selected by each HTTP handler.
@@ -371,4 +650,53 @@ pub struct ProductResponse {
     /// Livy provenance failure when fetching succeeded but attestation failed.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub provenance_error: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn source_validation_allows_http_private_destinations() {
+        assert!(validate_source_url("http://127.0.0.1:8080/path").is_ok());
+        assert!(validate_source_url("https://example.com/path").is_ok());
+    }
+
+    #[test]
+    fn source_validation_rejects_credentials_and_non_web_schemes() {
+        assert!(validate_source_url("https://user:pass@example.com").is_err());
+        assert!(validate_source_url("file:///etc/passwd").is_err());
+    }
+
+    #[test]
+    fn product_validation_enforces_route_and_numeric_bounds() {
+        let mut request = ProductRequest::legacy("https://example.com");
+        request.limit = Some(101);
+        assert!(request.validate_for(ProductRoute::Scrape).is_err());
+
+        let search = ProductRequest {
+            source: None,
+            query: Some("rust axum".to_string()),
+            ..ProductRequest::legacy("https://example.com")
+        };
+        assert!(search.validate_for(ProductRoute::Search).is_ok());
+    }
+
+    #[test]
+    fn rejects_unsafe_forwarded_headers() {
+        let mut request = ProductRequest::legacy("https://example.com");
+        request.headers = Some(HashMap::from([(
+            "Host".to_string(),
+            "internal.example".to_string(),
+        )]));
+        assert!(request.validate_for(ProductRoute::Scrape).is_err());
+    }
+
+    #[test]
+    fn validates_idempotency_and_receipt_identifiers() {
+        assert!(validate_idempotency_key(Some("retry:request-1")).is_ok());
+        assert!(validate_idempotency_key(Some("bad key")).is_err());
+        assert!(validate_receipt_id("18f-2").is_ok());
+        assert!(validate_receipt_id("../../secret").is_err());
+    }
 }

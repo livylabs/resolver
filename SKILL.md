@@ -23,19 +23,20 @@ sources through Spider-backed Livy access. It exposes:
 The resolver requires:
 
 ```dotenv
-SPIDER_API_KEY=your-spider-api-key
+LIVY_RESOLVER_KEY=your-resolver-key
 ```
 
 This repo does not include an MCP config file yet. The code loads `.env`
-and then reads `SPIDER_API_KEY` from the resolver process environment at
-startup. `LIVY_KEY` is accepted as a legacy alias.
+and then reads `LIVY_RESOLVER_KEY` from the resolver process environment at
+startup. `SPIDER_API_KEY`, `SPIDER_KEY`, and `LIVY_KEY` are accepted as legacy
+aliases.
 
 Configure the key based on how MCP is wired:
 
-- If the MCP config launches this repo, put `SPIDER_API_KEY` in that
+- If the MCP config launches this repo, put `LIVY_RESOLVER_KEY` in that
   server entry's `env`.
 - If the MCP client connects to an already-running
-  `http://localhost:3001/mcp`, configure `SPIDER_API_KEY` where that
+  `http://localhost:3001/mcp`, configure `LIVY_RESOLVER_KEY` where that
   server process is started.
 - For local manual runs, use a shell env var or local `.env`.
 
@@ -49,7 +50,7 @@ Example launch config:
       "args": ["run"],
       "cwd": "/path/to/resolver",
       "env": {
-        "SPIDER_API_KEY": "your-spider-api-key"
+        "LIVY_RESOLVER_KEY": "your-resolver-key"
       }
     }
   }
@@ -170,7 +171,7 @@ curl -s http://localhost:3001/fetch \
 
 - `src/main.rs`: mounts HTTP routes and `/mcp`
 - `src/mcp.rs`: defines `fetch_source`
-- `src/fetch.rs`: reads `SPIDER_API_KEY`, calls Spider, stores receipts
+- `src/fetch.rs`: reads `LIVY_RESOLVER_KEY`, calls Spider, stores receipts
 - `src/provenance.rs`: builds and posts generic resolver source-fetch
   attestations
 - `src/api.rs`: HTTP route handlers

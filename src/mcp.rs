@@ -5,6 +5,7 @@ use crate::credits::ResolverCreditsClient;
 use crate::errors::ResolverAuthError;
 use crate::fetch::Fetcher;
 use crate::types::FetchWithReceipt;
+use crate::types::{validate_idempotency_key, validate_source_url};
 use axum::{
     Json,
     body::{Body, to_bytes},
@@ -167,9 +168,28 @@ impl Server {
             Err(result) => return Ok(result),
         };
 
+        if let Err(err) = validate_source_url(&url)
+            .and_then(|_| validate_idempotency_key(idempotency_key.as_deref()))
+        {
+            return Ok(CallToolResult::error(vec![Content::text(format!(
+                "Invalid fetch_source request: {}",
+                public_validation_message(&err)
+            ))]));
+        }
+
         // Keep every fetch path, including cached unblock fallback, behind auth and credit debit.
         let started = Instant::now();
-        eprintln!("mcp fetch_source start url={url}");
+        let source_sha256 = crate::security::sensitive_hash(&url);
+        eprintln!(
+            "{}",
+            json!({
+                "event": "mcp_fetch_source_start",
+                "request_id": crate::security::current_request_id(),
+                "tenant_id": auth_context.tenant_id.as_deref(),
+                "project_id": auth_context.project_id.as_deref(),
+                "source_sha256": &source_sha256,
+            })
+        );
         match self
             .credits
             .debit_fetch_source(&auth_context, &url, idempotency_key.as_deref())
@@ -177,22 +197,43 @@ impl Server {
         {
             Ok(Some(outcome)) => {
                 eprintln!(
-                    "mcp fetch_source credits charged={} amount={} mode={} enforced={}",
-                    outcome.charged, outcome.amount, outcome.mode, outcome.enforced
+                    "{}",
+                    json!({
+                        "event": "mcp_credit_debit",
+                        "request_id": crate::security::current_request_id(),
+                        "source_sha256": &source_sha256,
+                        "charged": outcome.charged,
+                        "amount": outcome.amount,
+                        "mode": outcome.mode,
+                        "enforced": outcome.enforced,
+                    })
                 );
             }
             Ok(None) => {
-                eprintln!("mcp fetch_source credits skipped");
+                eprintln!(
+                    "{}",
+                    json!({
+                        "event": "mcp_credit_debit_skipped",
+                        "request_id": crate::security::current_request_id(),
+                        "source_sha256": &source_sha256,
+                    })
+                );
             }
             Err(err) => {
                 eprintln!(
-                    "mcp fetch_source credits error elapsed_ms={} error={err}",
-                    started.elapsed().as_millis()
+                    "{}",
+                    json!({
+                        "event": "mcp_credit_debit_failed",
+                        "request_id": crate::security::current_request_id(),
+                        "source_sha256": &source_sha256,
+                        "elapsed_ms": started.elapsed().as_millis(),
+                        "payment_required": err.is_payment_required(),
+                    })
                 );
                 let message = if err.is_payment_required() {
-                    format!("Livy payment required: {err}")
+                    "Livy payment required".to_string()
                 } else {
-                    format!("Livy credit authorization failed: {err}")
+                    "Livy credit authorization service is unavailable".to_string()
                 };
                 return Ok(CallToolResult::error(vec![Content::text(message)]));
             }
@@ -201,16 +242,31 @@ impl Server {
         let cache_key = normalize_fallback_url_key(&url);
         let fallback_reason = self.fallback_cache.lookup(&cache_key);
         let data = if let Some(reason) = fallback_reason {
-            eprintln!("mcp fetch_source fallback mode=unblock reason={reason} url={url}");
+            eprintln!(
+                "{}",
+                json!({
+                    "event": "mcp_fetch_source_fallback",
+                    "request_id": crate::security::current_request_id(),
+                    "mode": "unblock",
+                    "reason": reason,
+                    "source_sha256": &source_sha256,
+                })
+            );
             self.fetcher
                 .get_unblock_data_with_receipt_with_auth(&url, Some(&auth_context))
                 .await
-                .map_err(|e| {
+                .map_err(|_| {
                     eprintln!(
-                        "mcp fetch_source unblock error elapsed_ms={} error={e}",
-                        started.elapsed().as_millis()
+                        "{}",
+                        json!({
+                            "event": "mcp_fetch_source_failed",
+                            "request_id": crate::security::current_request_id(),
+                            "mode": "unblock",
+                            "source_sha256": &source_sha256,
+                            "elapsed_ms": started.elapsed().as_millis(),
+                        })
                     );
-                    ErrorData::internal_error(e.to_string(), None)
+                    ErrorData::internal_error("Upstream fetch failed", None)
                 })?
         } else {
             match self
@@ -233,28 +289,42 @@ impl Server {
                         e.to_string(),
                     );
                     eprintln!(
-                        "mcp fetch_source fast error elapsed_ms={} error={e}",
-                        started.elapsed().as_millis()
+                        "{}",
+                        json!({
+                            "event": "mcp_fetch_source_failed",
+                            "request_id": crate::security::current_request_id(),
+                            "mode": "fast",
+                            "source_sha256": &source_sha256,
+                            "elapsed_ms": started.elapsed().as_millis(),
+                        })
                     );
-                    return Err(ErrorData::internal_error(e.to_string(), None));
+                    return Err(ErrorData::internal_error("Upstream fetch failed", None));
                 }
             }
         };
 
         let text = render_fetch_result(&data);
         eprintln!(
-            "mcp fetch_source ok mode={} elapsed_ms={} response_bytes={}",
-            if fallback_reason.is_some() {
-                "unblock"
-            } else {
-                "fast"
-            },
-            started.elapsed().as_millis(),
-            text.len()
+            "{}",
+            json!({
+                "event": "mcp_fetch_source_ok",
+                "request_id": crate::security::current_request_id(),
+                "mode": if fallback_reason.is_some() { "unblock" } else { "fast" },
+                "source_sha256": &source_sha256,
+                "elapsed_ms": started.elapsed().as_millis(),
+                "response_bytes": text.len(),
+            })
         );
         let mut result = CallToolResult::structured(structured_fetch_result(&data));
         result.content = vec![Content::text(text)];
         Ok(result)
+    }
+}
+
+fn public_validation_message(error: &crate::errors::FetchError) -> &str {
+    match error {
+        crate::errors::FetchError::BadRequest(message) => message,
+        _ => "invalid input",
     }
 }
 
@@ -279,9 +349,13 @@ async fn require_mcp_oauth_or_challenge(
         .await
     {
         Ok(_) => next.run(request).await,
-        Err(ResolverAuthError::ServiceUnavailable(err)) => (
+        Err(ResolverAuthError::ServiceUnavailable(_)) => (
             StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({ "error": err })),
+            Json(json!({
+                "error": "OAuth validation service is unavailable",
+                "code": "auth_service_unavailable",
+                "request_id": crate::security::current_request_id(),
+            })),
         )
             .into_response(),
         Err(err) => {
@@ -308,7 +382,15 @@ fn mcp_http_oauth_challenge_response(
     error: &'static str,
     message: &'static str,
 ) -> Response {
-    let mut response = (status, Json(json!({ "error": message }))).into_response();
+    let mut response = (
+        status,
+        Json(json!({
+            "error": message,
+            "code": error,
+            "request_id": crate::security::current_request_id(),
+        })),
+    )
+        .into_response();
     if let Ok(value) = auth.challenge(FETCH_SOURCE_SCOPES, error, message).parse() {
         response
             .headers_mut()
@@ -538,9 +620,10 @@ impl Server {
             .await
         {
             Ok(context) => Ok(Ok(context)),
-            Err(ResolverAuthError::ServiceUnavailable(err)) => {
-                Err(ErrorData::internal_error(err, None))
-            }
+            Err(ResolverAuthError::ServiceUnavailable(_)) => Err(ErrorData::internal_error(
+                "OAuth validation service is unavailable",
+                None,
+            )),
             Err(err) => {
                 let Some((error, message)) = err.challenge_parts() else {
                     return Err(ErrorData::internal_error("OAuth validation failed", None));
@@ -714,7 +797,14 @@ fn extracted_content(data: &Value) -> Option<&str> {
 fn analyze_fetch_data_in_background(cache: Arc<FetchFallbackCache>, key: String, data: Value) {
     tokio::spawn(async move {
         if let Some(reason) = fallback_reason_for_fetch_data(&data) {
-            eprintln!("mcp fetch_source fallback flag reason={reason} key={key}");
+            eprintln!(
+                "{}",
+                json!({
+                    "event": "mcp_fetch_source_fallback_flag",
+                    "reason": reason,
+                    "source_sha256": crate::security::sensitive_hash(&key),
+                })
+            );
             cache.flag(key, reason);
         }
     });
@@ -723,7 +813,14 @@ fn analyze_fetch_data_in_background(cache: Arc<FetchFallbackCache>, key: String,
 fn analyze_fetch_error_in_background(cache: Arc<FetchFallbackCache>, key: String, error: String) {
     tokio::spawn(async move {
         if let Some(reason) = fallback_reason_for_text(&error) {
-            eprintln!("mcp fetch_source fallback flag reason={reason} key={key}");
+            eprintln!(
+                "{}",
+                json!({
+                    "event": "mcp_fetch_source_fallback_flag",
+                    "reason": reason,
+                    "source_sha256": crate::security::sensitive_hash(&key),
+                })
+            );
             cache.flag(key, reason);
         }
     });

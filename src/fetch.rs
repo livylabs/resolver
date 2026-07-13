@@ -32,10 +32,11 @@ pub struct Fetcher {
 impl Fetcher {
     pub fn new() -> Self {
         dotenvy::dotenv().ok();
-        let key = std::env::var("SPIDER_API_KEY")
+        let key = std::env::var("LIVY_RESOLVER_KEY")
+            .or_else(|_| std::env::var("SPIDER_API_KEY"))
             .or_else(|_| std::env::var("SPIDER_KEY"))
             .or_else(|_| std::env::var("LIVY_KEY"))
-            .expect("SPIDER_API_KEY, SPIDER_KEY, or LIVY_KEY must be set");
+            .expect("LIVY_RESOLVER_KEY must be set");
         let spider = Spider::new(Some(key)).expect("Can initiate fetcher service");
         let provenance = ProvenanceClient::from_env()
             .unwrap_or_else(|err| panic!("invalid provenance configuration: {err}"));
@@ -61,6 +62,7 @@ impl Fetcher {
         route: ProductRoute,
         auth_context: Option<&ResolverAuthContext>,
     ) -> Result<ProductResponse, FetchError> {
+        payload.validate_for(route)?;
         let mode = self.resolve_mode(payload.mode, route);
         let timeout_secs = payload.timeout_secs.unwrap_or_else(|| match mode {
             ProductMode::Unblock => 50,
@@ -259,7 +261,17 @@ impl Fetcher {
             .await
         {
             Ok(result) => (Some(result), None),
-            Err(err) => (None, Some(err.to_string())),
+            Err(_) => {
+                eprintln!(
+                    "{}",
+                    serde_json::json!({
+                        "event": "provenance_attestation_failed",
+                        "request_id": crate::security::current_request_id(),
+                        "error_kind": "provenance_error",
+                    })
+                );
+                (None, Some("provenance attestation unavailable".to_string()))
+            }
         }
     }
 
