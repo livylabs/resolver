@@ -37,7 +37,7 @@ pub async fn request_security(
 ) -> Response {
     let started = Instant::now();
     let method = request.method().to_string();
-    let path = normalized_path(request.uri().path());
+    let path = normalized_path(request.uri().path()).to_string();
     let request_id = incoming_request_id(&request).unwrap_or_else(new_request_id);
     request.extensions_mut().insert(request_id.clone());
 
