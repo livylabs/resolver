@@ -81,6 +81,8 @@ LIVY_PROVENANCE_VERIFICATION_MODE=verify_fresh
 LIVY_EXPLORER_BASE_URL=https://api.livylabs.xyz
 LIVY_PROVENANCE_BOOTSTRAP_TEMPLATE=false
 LIVY_PROVENANCE_MANAGED_PUBLICATION=true
+LIVY_PROVENANCE_PUBLISH_RESPONSE_ARTIFACT=true
+LIVY_PROVENANCE_RESPONSE_ARTIFACT_MAX_BYTES=262144
 LIVY_PROVENANCE_WAIT_FOR_REGISTRY_REFS=false
 LIVY_PROVENANCE_REGISTRY_WAIT_ATTEMPTS=30
 LIVY_PROVENANCE_REGISTRY_WAIT_INTERVAL_MS=2000
@@ -97,8 +99,21 @@ allowed to write provenance templates. Public explorer reads also require
 the matching public template to exist in Livy.
 
 `LIVY_PROVENANCE_MANAGED_PUBLICATION=true` asks Livy backend to publish the
-provenance receipt to Arweave and register it on the configured EVM registry.
-The resolver still returns the attestation immediately. Set
+provenance receipt and a versioned resolver request/response exchange to
+Arweave, then register the receipt on the configured EVM registry. The exchange
+is named `resolver-response.json` and uses the `resolver-tool-exchange-v1`
+schema. Its top-level `request` contains the same sanitized request summary used
+for the input commitment, while `response` contains the exact upstream JSON.
+The `commitments.request_sha256` and `commitments.response_sha256` values bind
+those fields to the attestation. Header and cookie values are never revealed;
+the request summary records only their presence or count. Artifacts larger than
+`LIVY_PROVENANCE_RESPONSE_ARTIFACT_MAX_BYTES` remain commitment-only so an
+oversized reveal cannot block receipt publication. Set
+`LIVY_PROVENANCE_PUBLISH_RESPONSE_ARTIFACT=false` to keep every response
+commitment-only. Response artifacts default on for public provenance and off
+for private provenance. Managed publication is public and irreversible, so
+enable it only for resolver outputs that are safe to disclose. The resolver
+still returns the attestation immediately. Set
 `LIVY_PROVENANCE_WAIT_FOR_REGISTRY_REFS=true` only when the caller should wait
 for public `registry_refs`; that mode requires the API key to have provenance
 read access in addition to write access.

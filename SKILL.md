@@ -97,12 +97,24 @@ LIVY_PROVENANCE_VISIBILITY=public
 LIVY_PROVENANCE_VERIFICATION_MODE=verify_fresh
 LIVY_EXPLORER_BASE_URL=https://api.livylabs.xyz
 LIVY_PROVENANCE_BOOTSTRAP_TEMPLATE=false
+LIVY_PROVENANCE_PUBLISH_RESPONSE_ARTIFACT=true
+LIVY_PROVENANCE_RESPONSE_ARTIFACT_MAX_BYTES=262144
 ```
 
 `LIVY_API_KEY` is for legacy/local service-key provenance writes. Only set
 `LIVY_PROVENANCE_BOOTSTRAP_TEMPLATE=true` if that API key has template
 write scope. Public explorer reads require the matching public template to
 exist in Livy.
+
+Managed publication uploads both `provenance-receipt.json` and a versioned
+request/response exchange as `resolver-response.json`. The
+`resolver-tool-exchange-v1` payload exposes the sanitized committed request as
+`request`, the exact upstream JSON as `response`, and both SHA-256 commitments.
+Header and cookie values remain redacted. Oversized exchanges stay
+commitment-only, and `LIVY_PROVENANCE_PUBLISH_RESPONSE_ARTIFACT=false` disables
+response reveals. Response reveals default on for public provenance and off for
+private provenance. Arweave publication is public and irreversible, so use it
+only for outputs that are safe to disclose.
 
 ## MCP Use
 

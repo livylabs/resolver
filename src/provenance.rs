@@ -10,8 +10,9 @@ use livy_provenance_sdk::{
     CreateProvenanceAttestationRequest, DEFAULT_LIVY_API_BASE_URL, ProvenanceAttestationField,
     ProvenanceAttestationResponse, ProvenanceClient as LivyProvenanceApiClient,
     ProvenanceClientConfig, ProvenanceCommitMode, ProvenanceFieldDisclosure,
-    ProvenanceManagedPublicationRequest, ProvenanceRegistryRefResponse, ProvenanceTemplateField,
-    ProvenanceVerificationMode, RegistryRefWaitOptions, UpsertProvenanceTemplateRequest,
+    ProvenanceManagedPublicationArtifact, ProvenanceManagedPublicationRequest,
+    ProvenanceRegistryRefResponse, ProvenanceTemplateField, ProvenanceVerificationMode,
+    RegistryRefWaitOptions, UpsertProvenanceTemplateRequest,
 };
 use livy_tee::Livy;
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
@@ -29,6 +30,9 @@ const DEFAULT_INTEGRATION_ID: &str = "delphi";
 const APPLICATION_DOMAIN: &str = "resolver";
 const SUBJECT_TYPE: &str = "resolver_fetch";
 const ATTESTATION_CLAIM: &str = "source";
+const DEFAULT_RESPONSE_ARTIFACT_MAX_BYTES: usize = 256 * 1024;
+const RESPONSE_ARTIFACT_KIND: &str = "livy_resolver_tool_exchange";
+const RESPONSE_ARTIFACT_SCHEMA: &str = "resolver-tool-exchange-v1";
 
 #[derive(Debug)]
 pub struct ProvenanceClient {
@@ -52,6 +56,8 @@ struct ProvenanceConfig {
     program_id: Option<String>,
     bootstrap_template: bool,
     managed_publication: bool,
+    publish_response_artifact: bool,
+    response_artifact_max_bytes: usize,
     wait_for_registry_refs: bool,
     registry_wait_attempts: u32,
     registry_wait_interval_ms: u64,
@@ -137,6 +143,23 @@ pub struct ResolverFetchEvidence<'a> {
     pub receipt: Option<&'a Receipt>,
 }
 
+#[derive(Serialize)]
+struct ResolverResponseArtifact<'a> {
+    kind: &'static str,
+    version: u8,
+    receipt_id: Option<&'a str>,
+    fetched_at_unix_ms: u64,
+    request: &'a Value,
+    response: &'a Value,
+    commitments: ResolverResponseArtifactCommitments<'a>,
+}
+
+#[derive(Serialize)]
+struct ResolverResponseArtifactCommitments<'a> {
+    request_sha256: &'a str,
+    response_sha256: &'a str,
+}
+
 impl ProvenanceClient {
     pub fn from_env() -> Result<Option<Self>, ProvenanceError> {
         let configured = env_present("LIVY_BACKEND_BASE_URL")
@@ -161,6 +184,10 @@ impl ProvenanceClient {
         let program_id = optional_env("LIVY_RESOLVER_PROGRAM_ID");
         let bootstrap_template = env_bool("LIVY_PROVENANCE_BOOTSTRAP_TEMPLATE")?.unwrap_or(false);
         let managed_publication = env_bool("LIVY_PROVENANCE_MANAGED_PUBLICATION")?.unwrap_or(true);
+        let publish_response_artifact = env_bool("LIVY_PROVENANCE_PUBLISH_RESPONSE_ARTIFACT")?
+            .unwrap_or(visibility == "public");
+        let response_artifact_max_bytes = env_usize("LIVY_PROVENANCE_RESPONSE_ARTIFACT_MAX_BYTES")?
+            .unwrap_or(DEFAULT_RESPONSE_ARTIFACT_MAX_BYTES);
         let wait_for_registry_refs =
             env_bool("LIVY_PROVENANCE_WAIT_FOR_REGISTRY_REFS")?.unwrap_or(false);
         let registry_wait_attempts =
@@ -200,6 +227,8 @@ impl ProvenanceClient {
                 program_id,
                 bootstrap_template,
                 managed_publication,
+                publish_response_artifact,
+                response_artifact_max_bytes,
                 wait_for_registry_refs,
                 registry_wait_attempts,
                 registry_wait_interval_ms,
@@ -219,15 +248,41 @@ impl ProvenanceClient {
     ) -> Result<ProvenanceResult, ProvenanceError> {
         let fetched_at_unix_ms = unix_millis()?;
         let source = primary_source(evidence.payload);
-        let data_sha256 = sha256_json_hex(evidence.data)?;
-        let data_bytes = serde_json::to_vec(evidence.data)?.len();
+        let response_bytes = serde_json::to_vec(evidence.data)?;
+        let data_sha256 = sha256_bytes_hex(&response_bytes);
+        let data_bytes = response_bytes.len();
         let input_commitment = request_summary(evidence.payload, evidence.route, evidence.mode);
+        let input_sha256 = sha256_json_hex(&input_commitment)?;
         let output_commitment = json!({
             "kind": "spider_response",
             "sha256": data_sha256,
             "bytes": data_bytes,
         });
         let receipt_id = evidence.receipt.map(|receipt| receipt.id.clone());
+        let response_artifact_enabled =
+            self.config.managed_publication && self.config.publish_response_artifact;
+        let response_artifact = if artifact_fits_limit(
+            response_artifact_enabled,
+            response_bytes.len(),
+            self.config.response_artifact_max_bytes,
+        ) {
+            let artifact = resolver_response_artifact_bytes(
+                &input_commitment,
+                evidence.data,
+                receipt_id.as_deref(),
+                fetched_at_unix_ms,
+                &input_sha256,
+                &data_sha256,
+            )?;
+            artifact_fits_limit(
+                true,
+                artifact.len(),
+                self.config.response_artifact_max_bytes,
+            )
+            .then_some(artifact)
+        } else {
+            None
+        };
         let subject_id = self.subject_id(
             &source,
             evidence.route,
@@ -289,10 +344,18 @@ impl ProvenanceClient {
                 "route": evidence.route.as_str(),
                 "mode": mode_label(evidence.mode),
                 "source_sha256": sha256_string_hex(&source),
-                "input_sha256": sha256_json_hex(&input_commitment)?,
+                "input_sha256": input_sha256,
                 "output_sha256": data_sha256,
                 "output_commitment_sha256": sha256_json_hex(&output_commitment)?,
                 "receipt_id": receipt_id,
+                "response_artifact": {
+                    "enabled": self.config.publish_response_artifact,
+                    "included": response_artifact.is_some(),
+                    "response_bytes": data_bytes,
+                    "artifact_bytes": response_artifact.as_ref().map(Vec::len),
+                    "max_bytes": self.config.response_artifact_max_bytes,
+                    "schema": RESPONSE_ARTIFACT_SCHEMA,
+                },
                 }),
             )?,
         };
@@ -303,6 +366,7 @@ impl ProvenanceClient {
                 evidence.route,
                 evidence.mode,
                 receipt_id.as_deref(),
+                response_artifact.as_deref(),
             ))
         } else {
             None
@@ -611,8 +675,9 @@ fn managed_publication_request(
     route: ProductRoute,
     mode: ProductMode,
     receipt_id: Option<&str>,
+    response_bytes: Option<&[u8]>,
 ) -> ProvenanceManagedPublicationRequest {
-    ProvenanceManagedPublicationRequest::livy_managed_registry()
+    let mut request = ProvenanceManagedPublicationRequest::livy_managed_registry()
         .with_livy_explorer_id(subject_id)
         .with_metadata(json!({
             "application_domain": APPLICATION_DOMAIN,
@@ -621,7 +686,45 @@ fn managed_publication_request(
             "route": route.as_str(),
             "mode": mode_label(mode),
             "receipt_id": receipt_id,
-        }))
+        }));
+    if let Some(response_bytes) = response_bytes {
+        request = request.with_artifact(
+            ProvenanceManagedPublicationArtifact::from_bytes(
+                "resolver-response.json",
+                "application/json",
+                response_bytes,
+            )
+            .with_tag("Livy-Artifact-Kind", "resolver-response")
+            .with_tag("Livy-Artifact-Schema", RESPONSE_ARTIFACT_SCHEMA),
+        );
+    }
+    request
+}
+
+fn resolver_response_artifact_bytes(
+    request: &Value,
+    response: &Value,
+    receipt_id: Option<&str>,
+    fetched_at_unix_ms: u64,
+    request_sha256: &str,
+    response_sha256: &str,
+) -> Result<Vec<u8>, ProvenanceError> {
+    Ok(serde_json::to_vec(&ResolverResponseArtifact {
+        kind: RESPONSE_ARTIFACT_KIND,
+        version: 1,
+        receipt_id,
+        fetched_at_unix_ms,
+        request,
+        response,
+        commitments: ResolverResponseArtifactCommitments {
+            request_sha256,
+            response_sha256,
+        },
+    })?)
+}
+
+fn artifact_fits_limit(enabled: bool, byte_len: usize, max_bytes: usize) -> bool {
+    enabled && byte_len <= max_bytes
 }
 
 fn provenance_metadata(
@@ -1043,6 +1146,22 @@ fn env_u64(name: &str) -> Result<Option<u64>, ProvenanceError> {
         .transpose()
 }
 
+fn env_usize(name: &str) -> Result<Option<usize>, ProvenanceError> {
+    optional_env(name)
+        .map(|value| {
+            value.parse::<usize>().map_err(|_| {
+                ProvenanceError::InvalidEnv(format!("{name} must be a positive integer"))
+            })
+        })
+        .transpose()
+        .and_then(|value| match value {
+            Some(0) => Err(ProvenanceError::InvalidEnv(format!(
+                "{name} must be a positive integer"
+            ))),
+            _ => Ok(value),
+        })
+}
+
 fn parse_verification_mode(value: &str) -> Result<ProvenanceVerificationMode, ProvenanceError> {
     match value.trim().to_ascii_lowercase().as_str() {
         "binding_only" => Ok(ProvenanceVerificationMode::BindingOnly),
@@ -1133,6 +1252,7 @@ mod tests {
             ProductRoute::Scrape,
             ProductMode::Fast,
             Some("receipt-1"),
+            Some(br#"{"ok":true}"#),
         );
         let value = serde_json::to_value(request).unwrap();
 
@@ -1143,6 +1263,92 @@ mod tests {
         assert_eq!(value["metadata"]["route"], "fetch");
         assert_eq!(value["metadata"]["mode"], "fast");
         assert_eq!(value["metadata"]["receipt_id"], "receipt-1");
+        assert_eq!(value["artifacts"][0]["name"], "resolver-response.json");
+        assert_eq!(value["artifacts"][0]["content_type"], "application/json");
+        assert_eq!(value["artifacts"][0]["data_base64"], "eyJvayI6dHJ1ZX0=");
+        assert_eq!(
+            value["artifacts"][0]["tags"][0],
+            json!({
+                "name": "Livy-Artifact-Kind",
+                "value": "resolver-response",
+            })
+        );
+        assert_eq!(
+            value["artifacts"][0]["tags"][1],
+            json!({
+                "name": "Livy-Artifact-Schema",
+                "value": RESPONSE_ARTIFACT_SCHEMA,
+            })
+        );
+        assert_eq!(
+            sha256_bytes_hex(br#"{"ok":true}"#),
+            sha256_json_hex(&json!({"ok": true})).unwrap()
+        );
+    }
+
+    #[test]
+    fn response_artifact_contains_request_response_and_commitments() {
+        let request = json!({
+            "route": "fetch",
+            "mode": "fast",
+            "source": "https://example.com/article",
+            "header_count": 1,
+            "cookies_present": true,
+        });
+        let response = json!([{
+            "status": 200,
+            "content": "verified source text",
+        }]);
+        let request_sha256 = sha256_json_hex(&request).unwrap();
+        let response_sha256 = sha256_json_hex(&response).unwrap();
+        let bytes = resolver_response_artifact_bytes(
+            &request,
+            &response,
+            Some("receipt-1"),
+            1_752_500_000_000,
+            &request_sha256,
+            &response_sha256,
+        )
+        .unwrap();
+        let artifact: Value = serde_json::from_slice(&bytes).unwrap();
+
+        assert_eq!(artifact["kind"], RESPONSE_ARTIFACT_KIND);
+        assert_eq!(artifact["version"], 1);
+        assert_eq!(artifact["receipt_id"], "receipt-1");
+        assert_eq!(artifact["fetched_at_unix_ms"], 1_752_500_000_000_u64);
+        assert_eq!(artifact["request"], request);
+        assert_eq!(artifact["response"], response);
+        assert_eq!(artifact["commitments"]["request_sha256"], request_sha256);
+        assert_eq!(artifact["commitments"]["response_sha256"], response_sha256);
+    }
+
+    #[test]
+    fn managed_publication_can_omit_oversized_response_artifact() {
+        let request = managed_publication_request(
+            "resolver_fetch:abc123",
+            ProductRoute::Scrape,
+            ProductMode::Fast,
+            Some("receipt-1"),
+            None,
+        );
+        let value = serde_json::to_value(request).unwrap();
+
+        assert_eq!(value["arweave"], true);
+        assert_eq!(value["registry"], true);
+        assert_eq!(value.get("artifacts"), None);
+    }
+
+    #[test]
+    fn response_artifact_respects_disclosure_and_size_limits() {
+        let response = br#"{"ok":true}"#;
+
+        assert!(artifact_fits_limit(true, response.len(), response.len()));
+        assert!(!artifact_fits_limit(
+            true,
+            response.len(),
+            response.len() - 1
+        ));
+        assert!(!artifact_fits_limit(false, response.len(), response.len()));
     }
 
     #[test]
