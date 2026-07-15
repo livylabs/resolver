@@ -33,6 +33,7 @@ const FETCH_SOURCE_SCOPES: &[&str] = &["tool:fetch_source", "resolver:source:fet
 const FETCH_SOURCE_TITLE: &str = "Fetch Source";
 const FETCH_SOURCE_INVOCATION_START: &str = "Fetching source";
 const FETCH_SOURCE_INVOCATION_DONE: &str = "Source fetched";
+const EXPLORER_QUERY_BASE_URL: &str = "https://explorer.livylabs.xyz/?q=";
 const MCP_COMPAT_BODY_LIMIT: usize = 1024 * 1024;
 const FALLBACK_CACHE_TTL: Duration = Duration::from_secs(30 * 60);
 const FALLBACK_CACHE_MAX_ENTRIES: usize = 1024;
@@ -696,6 +697,10 @@ fn fetch_source_output_schema() -> Value {
                 "type": "string",
                 "description": "Livy resolver receipt id for this fetch."
             },
+            "explorer": {
+                "type": "string",
+                "description": "Livy Explorer URL for this receipt."
+            },
             "source_url": {
                 "type": "string",
                 "description": "The exact URL that was fetched."
@@ -717,7 +722,7 @@ fn fetch_source_output_schema() -> Value {
                 "description": "Fetched source text or serialized upstream payload."
             }
         },
-        "required": ["receipt_id", "source_url", "text"],
+        "required": ["receipt_id", "explorer", "source_url", "text"],
         "additionalProperties": false
     })
 }
@@ -731,6 +736,10 @@ fn structured_fetch_result(data: &FetchWithReceipt) -> Value {
     let receipt = &data.receipt;
 
     result.insert("receipt_id".to_string(), json!(data.receipt_id));
+    result.insert(
+        "explorer".to_string(),
+        json!(explorer_url(&data.receipt_id)),
+    );
     result.insert("source_url".to_string(), json!(receipt.source_url));
     if let Some(status) = receipt.status {
         result.insert("status".to_string(), json!(status));
@@ -758,6 +767,7 @@ fn render_fetch_result(data: &FetchWithReceipt) -> String {
     let receipt = &data.receipt;
 
     let _ = writeln!(output, "receipt_id: {}", data.receipt_id);
+    let _ = writeln!(output, "explorer: {}", explorer_url(&data.receipt_id));
     let _ = writeln!(output, "status: {}", display_option(receipt.status));
     let _ = writeln!(
         output,
@@ -776,6 +786,10 @@ fn render_fetch_result(data: &FetchWithReceipt) -> String {
     }
 
     output
+}
+
+fn explorer_url(receipt_id: &str) -> String {
+    format!("{EXPLORER_QUERY_BASE_URL}{receipt_id}")
 }
 
 fn display_option<T: std::fmt::Display>(value: Option<T>) -> String {
@@ -944,9 +958,11 @@ impl ServerHandler for Server {}
 mod tests {
     use super::{
         FETCH_SOURCE_SCOPES, FallbackCacheEntry, FetchFallbackCache, Server,
-        mcp_http_oauth_challenge_response, oauth_challenge_result,
+        mcp_http_oauth_challenge_response, oauth_challenge_result, render_fetch_result,
+        structured_fetch_result,
     };
     use crate::auth::ResolverAuth;
+    use crate::types::{FetchWithReceipt, Receipt};
     use axum::{body::to_bytes, http::header};
     use serde_json::json;
     use std::time::{Duration, Instant};
@@ -1097,7 +1113,7 @@ mod tests {
         assert_eq!(message["result"]["tools"][0]["title"], "Fetch Source");
         assert_eq!(
             message["result"]["tools"][0]["outputSchema"]["required"],
-            json!(["receipt_id", "source_url", "text"])
+            json!(["receipt_id", "explorer", "source_url", "text"])
         );
         assert_eq!(
             message["result"]["tools"][0]["annotations"]["destructiveHint"],
@@ -1123,6 +1139,42 @@ mod tests {
             message["result"]["tools"][0]["_meta"]["openai/toolInvocation/invoked"],
             "Source fetched"
         );
+    }
+
+    #[test]
+    fn fetch_result_includes_receipt_explorer_url_in_all_mcp_outputs() {
+        let data = FetchWithReceipt {
+            receipt_id: "19f65ad0887-1".to_string(),
+            receipt: Receipt {
+                id: "19f65ad0887-1".to_string(),
+                source_url: "https://example.com/article".to_string(),
+                mode: "fast".to_string(),
+                request_type: "fetch".to_string(),
+                proxy: None,
+                status: Some(200),
+                error: None,
+                duration_elapsed_ms: Some(42),
+                content_bytes: Some(7),
+                total_cost: None,
+                created_at_unix_ms: 0,
+                demo_message: String::new(),
+            },
+            data: json!({"content": "example"}),
+            provenance: None,
+            provenance_error: None,
+        };
+
+        let structured = structured_fetch_result(&data);
+        assert_eq!(structured["receipt_id"], "19f65ad0887-1");
+        assert_eq!(
+            structured["explorer"],
+            "https://explorer.livylabs.xyz/?q=19f65ad0887-1"
+        );
+
+        let rendered = render_fetch_result(&data);
+        assert!(rendered.contains("receipt_id: 19f65ad0887-1\n"));
+        assert!(rendered.contains("explorer: https://explorer.livylabs.xyz/?q=19f65ad0887-1\n"));
+        assert!(!rendered.contains("<receipt_id>"));
     }
 
     #[test]
